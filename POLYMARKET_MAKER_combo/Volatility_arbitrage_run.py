@@ -2853,6 +2853,11 @@ def main():
             buy_status = str(primary_resp.get("status") or "").upper()
             filled_amt = float(primary_resp.get("filled") or 0.0)
             avg_price = primary_resp.get("avg_price")
+            if buy_status == "INSUFFICIENT_BALANCE":
+                print("[EXIT][BUY] 检测到余额不足且已执行批量撤单，脚本将退出主循环。")
+                strategy.stop("insufficient balance")
+                stop_event.set()
+                break
             if filled_amt > 0:
                 fallback_price = float(avg_price if avg_price is not None else ref_price)
                 prior_position = float(position_size or 0.0)
