@@ -1776,13 +1776,15 @@ def main():
                     f"{dt_start.isoformat()} 开启。"
                 )
 
+    sell_flow_enabled = bool(int(os.getenv("POLY_ENABLE_SELL_FLOW", "0")))
+
     cfg = StrategyConfig(
         token_id=token_id,
         buy_price_threshold=buy_threshold,
         drop_window_minutes=drop_window,
         drop_pct=drop_pct,
         profit_pct=profit_pct,
-        disable_sell_signals=True,
+        disable_sell_signals=not sell_flow_enabled,
         enable_incremental_drop_pct=enable_incremental_drop_pct,
         incremental_drop_pct_step=incremental_drop_pct_step,
     )
@@ -1977,7 +1979,11 @@ def main():
             latest[token_id] = {"price": last, "best_bid": bid, "best_ask": ask, "ts": ts}
             action = strategy.on_tick(best_ask=ask, best_bid=bid, ts=ts)
             if action and action.action in (ActionType.BUY, ActionType.SELL):
-                action_queue.put(action)
+                if action.action == ActionType.SELL and not sell_flow_enabled:
+                    print("[SELL][QUEUE] 卖出流程已禁用，忽略卖出信号。")
+                    strategy.on_reject("sell flow disabled")
+                else:
+                    action_queue.put(action)
             if _is_market_closed(pc):
                 print("[MARKET] 检测到市场关闭信号，准备退出…")
                 market_closed_detected = True
@@ -2220,7 +2226,12 @@ def main():
             )
             try:
                 if position_size is not None:
-                    _execute_sell(position_size, floor_hint=fallback_px, source="[POSITION][SYNC]")
+                    if sell_flow_enabled:
+                        _execute_sell(position_size, floor_hint=fallback_px, source="[POSITION][SYNC]")
+                    else:
+                        print(
+                            "[WATCHDOG][POSITION] 卖出流程已禁用，跳过旧仓位清理尝试。"
+                        )
             except Exception as exc:
                 print(f"[WATCHDOG][POSITION] 自动卖出旧仓位失败：{exc}")
 
@@ -2231,6 +2242,9 @@ def main():
 
         sell_only_event.set()
         strategy.enable_sell_only(reason)
+        if not sell_flow_enabled:
+            print("[COUNTDOWN] 卖出流程已禁用，跳过仅卖出模式的持仓同步与卖出。")
+            return
         _maybe_refresh_position_size("[COUNTDOWN] 进入仅卖出模式前同步持仓", force=True)
         has_position = _has_actionable_position()
 
@@ -2290,8 +2304,10 @@ def main():
     if sell_only_start_ts and time.time() >= sell_only_start_ts:
         _activate_sell_only("countdown window")
 
-    if market_deadline_ts:
+    if market_deadline_ts and sell_flow_enabled:
         threading.Thread(target=_countdown_monitor, daemon=True).start()
+    elif market_deadline_ts and not sell_flow_enabled:
+        print("[COUNTDOWN] 卖出流程已禁用，跳过倒计时仅卖出监控。")
 
     def _execute_sell(
         order_qty: Optional[float],
@@ -2300,6 +2316,11 @@ def main():
         source: str,
     ) -> None:
         nonlocal position_size, last_order_size
+
+        if not sell_flow_enabled:
+            print(f"[SELL][SKIP] {source} 卖出流程已禁用，跳过卖出执行。")
+            strategy.on_reject("sell flow disabled")
+            return
 
         position_snapshot_cache: Optional[
             Tuple[Optional[float], Optional[float], Optional[str]]
@@ -2561,8 +2582,8 @@ def main():
                 continue
 
             if action.action == ActionType.SELL:
-                floor_override = action.target_price
-                _execute_sell(position_size, floor_hint=floor_override, source="[SIGNAL]")
+                print("[SELL][QUEUE] 收到卖出信号但卖出流程已禁用，直接跳过。")
+                strategy.on_reject("sell flow disabled")
                 continue
 
             if action.action != ActionType.BUY:
@@ -2602,7 +2623,12 @@ def main():
                 )
                 pending_buy = action
                 buy_cooldown_until = time.time() + short_buy_cooldown
-                _execute_sell(actionable_position, floor_hint=None, source="[BUY][BLOCK]")
+                if sell_flow_enabled:
+                    _execute_sell(actionable_position, floor_hint=None, source="[BUY][BLOCK]")
+                else:
+                    print(
+                        "[BUY][BLOCK] 卖出流程已禁用，无法自动清仓，保持买入冷却等待。"
+                    )
                 continue
 
             if treat_as_dust:
@@ -2887,7 +2913,14 @@ def main():
             if filled_amt <= 0:
                 continue
 
-            _execute_sell(position_size, floor_hint=strategy.sell_trigger_price(), source="[POST-BUY]")
+            if sell_flow_enabled:
+                _execute_sell(
+                    position_size,
+                    floor_hint=strategy.sell_trigger_price(),
+                    source="[POST-BUY]",
+                )
+            else:
+                print("[POST-BUY] 卖出流程已禁用，跳过自动卖出触发。")
 
     except KeyboardInterrupt:
         print("[CMD] 捕获到 Ctrl+C，准备退出…")
