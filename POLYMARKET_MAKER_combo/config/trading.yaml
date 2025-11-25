@@ -10,6 +10,30 @@ min_quote_amount: 1.0         # 单笔买单最少花费的美元金额，用于
 
 # 可选：指定需要轮询下单的子市场列表（可混用 id/name）。
 # 每个条目至少需要提供 id（或 token_id/market_id），name 用于打印/日志。
+#
+# 支持的示例格式：
+# 1) 简单列表（按顺序轮询）：
+# submarkets:
+#   - "market_id_a"
+#   - "market_id_b"
+#
+# 2) 具名列表（便于日志/PUSH）：
+# submarkets:
+#   - id: "submarket_yes_id"
+#     name: "示例 YES 子市场"
+#   - id: "submarket_no_id"
+#     name: "示例 NO 子市场"
+#
+# 3) 带权重/数量的多子市场示例（自定义字段供上层脚本消费）：
+# submarkets:
+#   - id: "xxx_yes"
+#     name: "热点事件 YES"
+#     weight: 0.6          # 例如用于按权重拆分下单目标
+#     target_size: 12      # 指定该子市场单独的目标买入数量
+#   - id: "yyy_no"
+#     name: "热点事件 NO"
+#     weight: 0.4
+#     target_size: 8
 submarkets:
   - id: "submarket_yes_id"
     name: "示例 YES 子市场"
