@@ -518,6 +518,9 @@ def maker_buy_follow_bid(
     price_dp_active = base_price_dp
     tick = _order_tick(price_dp_active)
     next_probe_at = 0.0
+    status_events: Set[str] = set()
+    balance_ok = True
+    price_frozen = False
 
     def _maybe_update_price_dp(observed: Optional[int]) -> None:
         nonlocal price_dp_active, tick
@@ -568,7 +571,7 @@ def maker_buy_follow_bid(
             return False
 
     def _abort_due_to_balance(reason: str) -> bool:
-        nonlocal final_status, active_order, active_price
+        nonlocal final_status, active_order, active_price, balance_ok
 
         print(reason)
         if active_order:
@@ -585,6 +588,7 @@ def maker_buy_follow_bid(
             except Exception:
                 pass
         final_status = "INSUFFICIENT_BALANCE"
+        balance_ok = False
         return True
 
     while True:
@@ -713,6 +717,8 @@ def maker_buy_follow_bid(
 
         record = records.get(active_order)
         status_text = str(status_payload.get("status", "UNKNOWN"))
+        status_text_upper = status_text.upper()
+        status_events.add(status_text_upper)
         record_size = None
         if record is not None:
             try:
@@ -748,7 +754,6 @@ def maker_buy_follow_bid(
                     f"remaining={remaining:.{BUY_SIZE_DP}f}"
                 )
         remaining = max(goal_size - filled_total, 0.0)
-        status_text_upper = status_text.upper()
         if record is not None:
             record["filled"] = filled_amount
             record["status"] = status_text_upper
@@ -793,6 +798,7 @@ def maker_buy_follow_bid(
                 shared_active_prices[token_id] = active_price
                 should_reprice = price_update_guard(shared_active_prices)
             if not should_reprice:
+                price_frozen = True
                 total_price = sum(
                     float(val) for val in shared_active_prices.values() if isinstance(val, (int, float))
                 )
@@ -800,6 +806,7 @@ def maker_buy_follow_bid(
                     f"[MAKER][BUY] 子市场挂单价总和已达 {total_price:.4f}，保持当前挂单等待成交。"
                 )
                 continue
+            price_frozen = False
             print(
                 f"[MAKER][BUY] 买一上行 -> 撤单重挂 | old={active_price:.{price_dp_active}f} new={current_bid:.{price_dp_active}f}"
             )
@@ -838,22 +845,28 @@ def maker_buy_follow_bid(
             active_price = None
             if shared_active_prices is not None:
                 shared_active_prices.pop(token_id, None)
+            price_frozen = False
             continue
         if status_text_upper in cancel_states:
             active_order = None
             active_price = None
             if shared_active_prices is not None:
                 shared_active_prices.pop(token_id, None)
+            price_frozen = False
             continue
 
     avg_price = notional_sum / filled_total if filled_total > 0 else None
     remaining = max(goal_size - filled_total, 0.0)
+    status_events.add(final_status.upper())
     return {
         "status": final_status,
         "avg_price": avg_price,
         "filled": filled_total,
         "remaining": remaining,
         "orders": orders,
+        "states": sorted(status_events),
+        "balance_ok": balance_ok,
+        "price_frozen": price_frozen,
     }
 
 
@@ -863,6 +876,7 @@ def maker_multi_buy_follow_bid(
     target_size: float,
     *,
     price_sum_cap: Optional[float] = 1.0,
+    state_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     **kwargs: Any,
 ) -> Dict[str, Dict[str, Any]]:
     """Run :func:`maker_buy_follow_bid` across multiple submarkets.
@@ -874,6 +888,34 @@ def maker_multi_buy_follow_bid(
 
     summary: Dict[str, Dict[str, Any]] = {}
     active_prices: Dict[str, float] = {}
+    aggregated_states: Set[str] = set()
+    frozen_markets: Set[str] = set()
+    balance_ok = True
+
+    def _emit_state() -> None:
+        if state_callback is None:
+            return
+        markets_snapshot: Dict[str, Dict[str, Any]] = {}
+        for mid, payload in summary.items():
+            result = payload.get("result") if isinstance(payload, dict) else None
+            if not isinstance(result, dict):
+                continue
+            markets_snapshot[mid] = {
+                "status": result.get("status"),
+                "filled": result.get("filled"),
+                "remaining": result.get("remaining"),
+                "price_frozen": bool(result.get("price_frozen")),
+            }
+        snapshot = {
+            "markets": markets_snapshot,
+            "states": sorted(aggregated_states),
+            "balance_ok": balance_ok,
+            "price_frozen_markets": sorted(frozen_markets),
+        }
+        try:
+            state_callback(snapshot)
+        except Exception as exc:
+            print(f"[MAKER][BUY][CALLBACK] 状态回调异常：{exc}")
 
     def _price_guard(price_map: Dict[str, float]) -> bool:
         cap = price_sum_cap if price_sum_cap is not None else None
@@ -903,18 +945,59 @@ def maker_multi_buy_follow_bid(
             print("[MAKER][BUY][WARN] 跳过缺少 market/token id 的子市场条目：", entry)
             continue
 
-        result = maker_buy_follow_bid(
-            client,
-            token_id=market_id,
-            target_size=target_size,
-            shared_active_prices=active_prices,
-            price_update_guard=_price_guard,
-            **kwargs,
-        )
+        try:
+            result = maker_buy_follow_bid(
+                client,
+                token_id=market_id,
+                target_size=target_size,
+                shared_active_prices=active_prices,
+                price_update_guard=_price_guard,
+                **kwargs,
+            )
+        except Exception as exc:
+            summary[market_id] = {
+                "name": label or market_id,
+                "result": {
+                    "status": "ERROR",
+                    "error": str(exc),
+                    "filled": 0.0,
+                    "remaining": target_size,
+                    "orders": [],
+                    "states": ["ERROR"],
+                    "balance_ok": balance_ok,
+                    "price_frozen": False,
+                },
+            }
+            aggregated_states.add("ERROR")
+            _emit_state()
+            raise
+
+        states = set(result.get("states") or [])
+        if result.get("status"):
+            states.add(str(result.get("status")).upper())
+        aggregated_states.update(states)
+        if not result.get("balance_ok", True):
+            balance_ok = False
+        if result.get("price_frozen"):
+            frozen_markets.add(market_id)
+        elif market_id in frozen_markets:
+            frozen_markets.discard(market_id)
+
         summary[market_id] = {
             "name": label or market_id,
             "result": result,
         }
+        _emit_state()
+        if not balance_ok:
+            break
+
+    summary["_meta"] = {
+        "states": sorted(aggregated_states),
+        "balance_ok": balance_ok,
+        "price_frozen_markets": sorted(frozen_markets),
+    }
+
+    _emit_state()
 
     return summary
 
