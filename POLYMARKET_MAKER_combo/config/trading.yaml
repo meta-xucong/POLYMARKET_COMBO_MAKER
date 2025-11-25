@@ -34,8 +34,5 @@ min_quote_amount: 1.0         # 单笔买单最少花费的美元金额，用于
 #     name: "热点事件 NO"
 #     weight: 0.4
 #     target_size: 8
-submarkets:
-  - id: "submarket_yes_id"
-    name: "示例 YES 子市场"
-  - id: "submarket_no_id"
-    name: "示例 NO 子市场"
+# 默认不预填示例子市场，使用前请填入实际的子市场 ID/名称。
+submarkets: []
