@@ -309,6 +309,130 @@ def _cancel_order(client: Any, order_id: Optional[str]) -> bool:
     return False
 
 
+def _cancel_all_open_orders(client: Any, token_id: Optional[str] = None) -> bool:
+    method_names = (
+        "cancel_open_orders",
+        "cancelOpenOrders",
+        "cancel_all_orders",
+        "cancelAllOrders",
+        "cancel_orders",
+        "cancelOrders",
+        "cancel_all",
+        "cancelAll",
+    )
+
+    targets: deque[Any] = deque([client])
+    visited: set[int] = set()
+    while targets:
+        obj = targets.popleft()
+        if obj is None:
+            continue
+        obj_id = id(obj)
+        if obj_id in visited:
+            continue
+        visited.add(obj_id)
+
+        for name in method_names:
+            method = getattr(obj, name, None)
+            if not callable(method):
+                continue
+            try:
+                method() if token_id is None else method(token_id)
+                return True
+            except TypeError:
+                try:
+                    method(token_id=token_id)
+                    return True
+                except Exception:
+                    continue
+            except Exception:
+                continue
+
+        for attr in ("client", "api", "private"):
+            nested = getattr(obj, attr, None)
+            if nested is not None:
+                targets.append(nested)
+    return False
+
+
+def _extract_available_balance(payload: Any, token_id: Optional[str]) -> Optional[float]:
+    if payload is None:
+        return None
+
+    if isinstance(payload, Mapping):
+        direct_keys = ("available", "availableBalance", "balance", "free")
+        for key in direct_keys:
+            candidate = _coerce_float(payload.get(key))
+            if candidate is not None:
+                return candidate
+
+        if token_id:
+            tid = str(token_id)
+            if tid in payload:
+                candidate = _extract_available_balance(payload.get(tid), None)
+                if candidate is not None:
+                    return candidate
+
+        for value in payload.values():
+            candidate = _extract_available_balance(value, token_id)
+            if candidate is not None:
+                return candidate
+
+    if isinstance(payload, Iterable) and not isinstance(payload, (str, bytes, bytearray)):
+        for item in payload:
+            candidate = _extract_available_balance(item, token_id)
+            if candidate is not None:
+                return candidate
+
+    return _coerce_float(payload) if isinstance(payload, (int, float, str)) else None
+
+
+def _fetch_available_balance(client: Any, token_id: Optional[str]) -> Optional[float]:
+    method_candidates = (
+        ("get_available_balance", {}),
+        ("get_balance", {}),
+        ("get_balances", {}),
+        ("get_positions", {}),
+        ("get_positions", {"token_id": token_id} if token_id is not None else {}),
+    )
+
+    targets: deque[Any] = deque([client])
+    visited: set[int] = set()
+    while targets:
+        obj = targets.popleft()
+        if obj is None:
+            continue
+        obj_id = id(obj)
+        if obj_id in visited:
+            continue
+        visited.add(obj_id)
+
+        for name, kwargs in method_candidates:
+            method = getattr(obj, name, None)
+            if not callable(method):
+                continue
+            try:
+                payload = method(**kwargs)
+            except TypeError:
+                try:
+                    payload = method()
+                except Exception:
+                    continue
+            except Exception:
+                continue
+
+            extracted = _extract_available_balance(payload, token_id)
+            if extracted is not None:
+                return extracted
+
+        for attr in ("client", "api", "private"):
+            nested = getattr(obj, attr, None)
+            if nested is not None:
+                targets.append(nested)
+
+    return None
+
+
 def _order_tick(dp: int) -> float:
     return 10 ** (-dp)
 
@@ -391,12 +515,6 @@ def maker_buy_follow_bid(
     base_price_dp = BUY_PRICE_DP if price_dp is None else max(int(price_dp), 0)
     price_dp_active = base_price_dp
     tick = _order_tick(price_dp_active)
-    # 采用统一的两级缩减步长，先用 0.01，多次失败后升级到 0.1
-    size_tick = 0.01
-    shortage_retry_count = 0
-    min_shrink_interval = 0.1
-    last_shrink_time = 0.0
-
     next_probe_at = 0.0
 
     def _maybe_update_price_dp(observed: Optional[int]) -> None:
@@ -447,8 +565,8 @@ def maker_buy_follow_bid(
         except Exception:
             return False
 
-    def _handle_balance_shortage(reason: str, min_viable: float) -> bool:
-        nonlocal goal_size, remaining, active_order, active_price, final_status, shortage_retry_count, size_tick, last_shrink_time
+    def _abort_due_to_balance(reason: str) -> bool:
+        nonlocal final_status, active_order, active_price
 
         print(reason)
         if active_order:
@@ -458,38 +576,8 @@ def maker_buy_follow_bid(
                 rec["status"] = "CANCELLED"
         active_order = None
         active_price = None
-        current_remaining = max(goal_size - filled_total, 0.0)
-        if current_remaining <= _MIN_FILL_EPS:
-            final_status = "FILLED" if filled_total > _MIN_FILL_EPS else final_status
-            return True
-        shortage_retry_count += 1
-        if shortage_retry_count > 100 and size_tick < 0.1:
-            size_tick = 0.1
-            print("[MAKER][BUY] 余额不足重试超过 100 次，提升缩减步长至 0.1。")
-
-        now = time.monotonic()
-        elapsed = now - last_shrink_time
-        if elapsed < min_shrink_interval:
-            sleep_duration = min_shrink_interval - elapsed
-            if sleep_duration > 0:
-                sleep_fn(sleep_duration)
-            now = time.monotonic()
-        last_shrink_time = now
-
-        shrink_candidate = _ceil_to_dp(max(current_remaining - size_tick, 0.0), BUY_SIZE_DP)
-        min_viable = max(min_viable or 0.0, api_min_qty or 0.0)
-        if shrink_candidate > _MIN_FILL_EPS and (
-            not min_viable or shrink_candidate + _MIN_FILL_EPS >= min_viable
-        ):
-            print(
-                "[MAKER][BUY] 重新调整买入目标 -> "
-                f"old={current_remaining:.{BUY_SIZE_DP}f} new={shrink_candidate:.{BUY_SIZE_DP}f}"
-            )
-            goal_size = filled_total + shrink_candidate
-            remaining = max(goal_size - filled_total, 0.0)
-            return False
-        print("[MAKER][BUY] 无法在满足最小下单量的前提下继续缩减，终止买入。")
-        final_status = "FILLED_TRUNCATED" if filled_total > _MIN_FILL_EPS else "SKIPPED_TOO_SMALL"
+        _cancel_all_open_orders(client, token_id)
+        final_status = "INSUFFICIENT_BALANCE"
         return True
 
     while True:
@@ -526,6 +614,26 @@ def maker_buy_follow_bid(
             if api_min_qty:
                 eff_qty = max(eff_qty, api_min_qty)
             eff_qty = _ceil_to_dp(eff_qty, BUY_SIZE_DP)
+            available_balance = _fetch_available_balance(client, token_id)
+            required_notional = px * eff_qty
+            if (
+                available_balance is not None
+                and required_notional > 0
+                and available_balance + 1e-12 < required_notional
+            ):
+                should_stop = _abort_due_to_balance(
+                    "[MAKER][BUY] 可用余额不足，批量撤单并退出循环。"
+                    f" available={available_balance:.4f} required={required_notional:.4f}"
+                )
+                if should_stop:
+                    break
+            min_qty = 0.0
+            if min_quote_amt and min_quote_amt > 0:
+                min_qty = _ceil_to_dp(min_quote_amt / max(px, 1e-9), BUY_SIZE_DP)
+            eff_qty = max(remaining, min_qty)
+            if api_min_qty:
+                eff_qty = max(eff_qty, api_min_qty)
+            eff_qty = _ceil_to_dp(eff_qty, BUY_SIZE_DP)
             if eff_qty <= 0:
                 final_status = "SKIPPED"
                 break
@@ -541,11 +649,9 @@ def maker_buy_follow_bid(
             try:
                 response = adapter.create_order(payload)
             except Exception as exc:
-                min_viable = max(min_qty or 0.0, api_min_qty or 0.0)
                 if _is_insufficient_balance(exc):
-                    should_stop = _handle_balance_shortage(
-                        "[MAKER][BUY] 下单失败，疑似余额不足，尝试缩减买入目标后重试。",
-                        min_viable,
+                    should_stop = _abort_due_to_balance(
+                        f"[MAKER][BUY] 下单余额不足，批量撤单退出：{exc}"
                     )
                     if should_stop:
                         break
@@ -691,9 +797,8 @@ def maker_buy_follow_bid(
         if status_text_upper in invalid_states or status_shortage:
             reason = "[MAKER][BUY] 订单被撮合层标记为 INVALID，尝试调整买入目标后重试。"
             if status_shortage and status_text_upper not in invalid_states:
-                reason = "[MAKER][BUY] 订单状态提示余额不足，尝试调整买入目标后重试。"
-            min_viable = max(min_buyable or 0.0, api_min_qty or 0.0)
-            should_stop = _handle_balance_shortage(reason, min_viable)
+                reason = "[MAKER][BUY] 订单状态提示余额不足，批量撤单后退出。"
+            should_stop = _abort_due_to_balance(reason)
             if should_stop:
                 break
             continue
@@ -820,9 +925,6 @@ def maker_sell_follow_ask_with_floor_wait(
     aggressive_next_price_override: Optional[float] = None
     aggressive_locked_price: Optional[float] = None
     next_price_override: Optional[float] = None
-    # 统一两级缩减步长，先用 0.01，必要时再升级到 0.1
-    shrink_tick = 0.01
-    shortage_retry_count = 0
     try:
         aggressive_timeout = float(aggressive_timeout)
     except (TypeError, ValueError):
@@ -852,6 +954,23 @@ def maker_sell_follow_ask_with_floor_wait(
     next_probe_at = 0.0
     next_position_refresh = 0.0
     next_ask_validation = 0.0
+
+    def _abort_sell_due_to_balance(reason: str) -> bool:
+        nonlocal final_status, active_order, active_price, aggressive_timer_start, aggressive_timer_anchor_fill
+
+        print(reason)
+        if active_order:
+            _cancel_order(client, active_order)
+            rec = records.get(active_order)
+            if rec is not None:
+                rec["status"] = "CANCELLED"
+        active_order = None
+        active_price = None
+        aggressive_timer_start = None
+        aggressive_timer_anchor_fill = None
+        _cancel_all_open_orders(client, token_id)
+        final_status = "INSUFFICIENT_BALANCE"
+        return True
 
     while True:
         if stop_check and stop_check():
@@ -1027,6 +1146,18 @@ def maker_sell_follow_ask_with_floor_wait(
             if api_min_qty and qty + _MIN_FILL_EPS < api_min_qty:
                 final_status = "FILLED_TRUNCATED" if filled_total > _MIN_FILL_EPS else "SKIPPED_TOO_SMALL"
                 break
+            available_balance = _fetch_available_balance(client, token_id)
+            if (
+                available_balance is not None
+                and qty > 0
+                and available_balance + 1e-12 < qty
+            ):
+                should_stop = _abort_sell_due_to_balance(
+                    "[MAKER][SELL] 可用仓位不足，批量撤单后退出。"
+                    f" available={available_balance:.4f} required={qty:.4f}"
+                )
+                if should_stop:
+                    break
             payload = {
                 "tokenId": token_id,
                 "side": "SELL",
@@ -1044,31 +1175,12 @@ def maker_sell_follow_ask_with_floor_wait(
                     keyword in msg for keyword in ("insufficient", "balance", "position")
                 )
                 if insufficient:
-                    shortage_retry_count += 1
-                    if shortage_retry_count > 100 and shrink_tick < 0.1 - 1e-12:
-                        shrink_tick = 0.1
-                    current_remaining = max(goal_size - filled_total, 0.0)
-                    shrink_qty = _floor_to_dp(
-                        max(current_remaining - shrink_tick, 0.0), SELL_SIZE_DP
+                    should_stop = _abort_sell_due_to_balance(
+                        f"[MAKER][SELL] 下单仓位不足，批量撤单退出：{exc}"
                     )
-                    if shrink_qty >= 0.01 and (
-                        not api_min_qty or shrink_qty + _MIN_FILL_EPS >= api_min_qty
-                    ):
-                        print(
-                            "[MAKER][SELL] 可用仓位不足，调整卖出数量后重试 -> "
-                            f"old={qty:.{SELL_SIZE_DP}f} new={shrink_qty:.{SELL_SIZE_DP}f}"
-                        )
-                        goal_size = filled_total + shrink_qty
-                        remaining = max(goal_size - filled_total, 0.0)
-                        continue
-                    final_status = (
-                        "FILLED_TRUNCATED" if filled_total > _MIN_FILL_EPS else "SKIPPED_TOO_SMALL"
-                    )
-                    remaining = max(goal_size - filled_total, 0.0)
-                    print(
-                        "[MAKER][SELL] 可用仓位低于最小挂单量，放弃后续卖出尝试。"
-                    )
-                    break
+                    if should_stop:
+                        break
+                    continue
                 raise
             order_id = str(response.get("orderId"))
             record = {
