@@ -140,6 +140,37 @@ def test_maker_buy_reprices_on_bid_rise():
     assert first_order["price"] == pytest.approx(0.50, rel=0, abs=1e-9)
 
 
+def test_maker_buy_skips_reprice_when_sum_cap_hit():
+    shared_prices: Dict[str, float] = {"other": 0.6}
+    client = DummyClient(
+        status_sequences=[
+            [
+                {"status": "OPEN", "filledAmount": 0.0},
+                {"status": "FILLED", "filledAmount": 1.0, "avgPrice": 0.55},
+            ],
+        ]
+    )
+
+    bids = _stream([0.5, 0.55, 0.55])
+
+    result = maker.maker_buy_follow_bid(
+        client,
+        token_id="asset",
+        target_size=1.0,
+        poll_sec=0.0,
+        min_quote_amt=0.0,
+        min_order_size=0.0,
+        best_bid_fn=bids,
+        sleep_fn=lambda _: None,
+        shared_active_prices=shared_prices,
+        price_update_guard=lambda price_map: sum(price_map.values()) < 1.0,
+    )
+
+    assert result["filled"] == pytest.approx(1.0)
+    assert shared_prices.get("asset") == pytest.approx(0.5)
+    assert len(client.created_orders) == 1
+
+
 def test_maker_buy_handles_missing_fill_amount_on_match():
     client = DummyClient(status_sequences=[[{"status": "MATCHED"}]])
 

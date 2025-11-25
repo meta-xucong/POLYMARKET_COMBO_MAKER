@@ -482,6 +482,8 @@ def maker_buy_follow_bid(
     progress_probe_interval: float = 60.0,
     price_dp: Optional[int] = None,
     external_fill_probe: Optional[Callable[[], Optional[float]]] = None,
+    shared_active_prices: Optional[Dict[str, float]] = None,
+    price_update_guard: Optional[Callable[[Dict[str, float]], bool]] = None,
 ) -> Dict[str, Any]:
     """Continuously maintain a maker buy order following the market bid."""
 
@@ -676,6 +678,8 @@ def maker_buy_follow_bid(
             accounted[order_id] = 0.0
             active_order = order_id
             active_price = px
+            if shared_active_prices is not None:
+                shared_active_prices[token_id] = px
             if progress_probe:
                 interval = max(progress_probe_interval, poll_sec, 1e-6)
                 try:
@@ -784,6 +788,18 @@ def maker_buy_follow_bid(
             break
 
         if current_bid is not None and active_price is not None and current_bid >= active_price + tick - 1e-12:
+            should_reprice = True
+            if price_update_guard and shared_active_prices is not None:
+                shared_active_prices[token_id] = active_price
+                should_reprice = price_update_guard(shared_active_prices)
+            if not should_reprice:
+                total_price = sum(
+                    float(val) for val in shared_active_prices.values() if isinstance(val, (int, float))
+                )
+                print(
+                    f"[MAKER][BUY] 子市场挂单价总和已达 {total_price:.4f}，保持当前挂单等待成交。"
+                )
+                continue
             print(
                 f"[MAKER][BUY] 买一上行 -> 撤单重挂 | old={active_price:.{price_dp_active}f} new={current_bid:.{price_dp_active}f}"
             )
@@ -820,10 +836,14 @@ def maker_buy_follow_bid(
         if status_text_upper in final_states:
             active_order = None
             active_price = None
+            if shared_active_prices is not None:
+                shared_active_prices.pop(token_id, None)
             continue
         if status_text_upper in cancel_states:
             active_order = None
             active_price = None
+            if shared_active_prices is not None:
+                shared_active_prices.pop(token_id, None)
             continue
 
     avg_price = notional_sum / filled_total if filled_total > 0 else None
@@ -841,6 +861,8 @@ def maker_multi_buy_follow_bid(
     client: Any,
     submarkets: Iterable[Any],
     target_size: float,
+    *,
+    price_sum_cap: Optional[float] = 1.0,
     **kwargs: Any,
 ) -> Dict[str, Dict[str, Any]]:
     """Run :func:`maker_buy_follow_bid` across multiple submarkets.
@@ -851,6 +873,19 @@ def maker_multi_buy_follow_bid(
     """
 
     summary: Dict[str, Dict[str, Any]] = {}
+    active_prices: Dict[str, float] = {}
+
+    def _price_guard(price_map: Dict[str, float]) -> bool:
+        cap = price_sum_cap if price_sum_cap is not None else None
+        if cap is None or cap <= 0:
+            return True
+        total = sum(float(val) for val in price_map.values() if isinstance(val, (int, float)))
+        if total >= cap - 1e-12:
+            print(
+                f"[MAKER][BUY] 所选子市场挂单价总和 {total:.4f} 已达到上限 {cap:.4f}，停止继续跟随买一上浮。"
+            )
+            return False
+        return True
     for entry in submarkets:
         market_id: Optional[str] = None
         label: Optional[str] = None
@@ -872,6 +907,8 @@ def maker_multi_buy_follow_bid(
             client,
             token_id=market_id,
             target_size=target_size,
+            shared_active_prices=active_prices,
+            price_update_guard=_price_guard,
             **kwargs,
         )
         summary[market_id] = {
