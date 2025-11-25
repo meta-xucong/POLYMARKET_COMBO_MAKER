@@ -2458,6 +2458,45 @@ def main():
                 f"price={display_price:.4f} size={sold_display:.4f} status={sell_status}{dust_note}"
             )
 
+    submarket_order_tracker: Dict[str, Dict[str, Any]] = {}
+
+    def _record_submarket_orders(summary: Dict[str, Dict[str, Any]]) -> None:
+        nonlocal submarket_order_tracker
+        tracker: Dict[str, Dict[str, Any]] = {}
+        for market_id, payload in summary.items():
+            if not isinstance(payload, dict):
+                continue
+            result = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+            if not isinstance(result, dict):
+                continue
+            try:
+                filled = float(result.get("filled") or 0.0)
+            except (TypeError, ValueError):
+                filled = 0.0
+            try:
+                remaining_val = float(result.get("remaining") or 0.0)
+            except (TypeError, ValueError):
+                remaining_val = 0.0
+            tracker[market_id] = {
+                "name": payload.get("name") or market_id,
+                "filled": max(filled, 0.0),
+                "remaining": max(remaining_val, 0.0),
+                "status": str(result.get("status") or "").upper(),
+            }
+        if tracker:
+            submarket_order_tracker = tracker
+
+    def _all_tracked_orders_completed() -> bool:
+        if not submarket_order_tracker:
+            return False
+        final_states = {"FILLED", "COMPLETED", "MATCHED", "EXECUTED"}
+        for state in submarket_order_tracker.values():
+            remaining = float(state.get("remaining") or 0.0)
+            status = str(state.get("status") or "").upper()
+            if remaining > 1e-4 and status not in final_states:
+                return False
+        return True
+
     try:
         while not stop_event.is_set():
             now = time.time()
@@ -2498,6 +2537,22 @@ def main():
 
             if now >= next_position_sync:
                 _maybe_refresh_position_size("[LOOP]")
+
+            if _all_tracked_orders_completed():
+                completed_notes = []
+                for market_id, state in submarket_order_tracker.items():
+                    name = state.get("name") or market_id
+                    filled = float(state.get("filled") or 0.0)
+                    remaining = float(state.get("remaining") or 0.0)
+                    completed_notes.append(
+                        f"{name} 已成交 {filled:.4f}，剩余 {remaining:.4f}"
+                    )
+                print("[ORDERS] 所有子市场挂单均已完成，准备退出主循环。")
+                for note in completed_notes:
+                    print(f"         - {note}")
+                strategy.stop("all submarket orders completed")
+                stop_event.set()
+                break
 
             if sell_only_event.is_set() and exit_after_sell_only_clear:
                 status = strategy.status()
@@ -2850,6 +2905,7 @@ def main():
 
             primary_resp = _primary_buy_result(buy_summary)
             print(f"[TRADE][BUY][MAKER] summary={buy_summary}")
+            _record_submarket_orders(buy_summary)
             buy_status = str(primary_resp.get("status") or "").upper()
             filled_amt = float(primary_resp.get("filled") or 0.0)
             avg_price = primary_resp.get("avg_price")
