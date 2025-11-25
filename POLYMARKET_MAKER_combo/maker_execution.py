@@ -858,6 +858,18 @@ def maker_buy_follow_bid(
     avg_price = notional_sum / filled_total if filled_total > 0 else None
     remaining = max(goal_size - filled_total, 0.0)
     status_events.add(final_status.upper())
+
+    if final_status.upper() == "FILLED":
+        price_display = avg_price if avg_price is not None else active_price
+        if price_display is None:
+            price_text = "N/A"
+        else:
+            price_text = f"{float(price_display):.{price_dp_active}f}"
+        print(
+            f"[MAKER][BUY] 子市场 {token_id} 已全部成交 -> filled={filled_total:.{BUY_SIZE_DP}f} "
+            f"avg_price={price_text}"
+        )
+
     return {
         "status": final_status,
         "avg_price": avg_price,
@@ -924,7 +936,7 @@ def maker_multi_buy_follow_bid(
         total = sum(float(val) for val in price_map.values() if isinstance(val, (int, float)))
         if total >= cap - 1e-12:
             print(
-                f"[MAKER][BUY] 所选子市场挂单价总和 {total:.4f} 已达到上限 {cap:.4f}，停止继续跟随买一上浮。"
+                f"[MAKER][BUY] 所选子市场挂单价总和 {total:.4f} 已达到上限 {cap:.4f}，触发价格冻结保护，暂停继续抬价。"
             )
             return False
         return True
@@ -989,6 +1001,7 @@ def maker_multi_buy_follow_bid(
         }
         _emit_state()
         if not balance_ok:
+            print("[MAKER][BUY] 多子市场轮询检测到余额不足，停止本轮跟单。")
             break
 
     summary["_meta"] = {
@@ -996,6 +1009,19 @@ def maker_multi_buy_follow_bid(
         "balance_ok": balance_ok,
         "price_frozen_markets": sorted(frozen_markets),
     }
+
+    if frozen_markets:
+        frozen_display = ", ".join(sorted(str(x) for x in frozen_markets))
+        print(f"[MAKER][BUY] 价格冻结保护生效，冻结子市场列表：{frozen_display}")
+
+    if summary and all(
+        isinstance(payload, dict)
+        and isinstance(payload.get("result"), dict)
+        and str(payload["result"].get("status", "")).upper() == "FILLED"
+        for key, payload in summary.items()
+        if not str(key).startswith("_")
+    ):
+        print("[MAKER][BUY] 多子市场目标已全部成交。")
 
     _emit_state()
 
