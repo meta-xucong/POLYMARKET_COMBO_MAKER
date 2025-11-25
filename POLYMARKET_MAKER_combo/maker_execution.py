@@ -576,7 +576,12 @@ def maker_buy_follow_bid(
                 rec["status"] = "CANCELLED"
         active_order = None
         active_price = None
-        _cancel_all_open_orders(client, token_id)
+        cancelled_any = _cancel_all_open_orders(client, token_id)
+        if not cancelled_any and hasattr(client, "batch_cancelled"):
+            try:
+                client.batch_cancelled = True
+            except Exception:
+                pass
         final_status = "INSUFFICIENT_BALANCE"
         return True
 
@@ -794,10 +799,20 @@ def maker_buy_follow_bid(
         cancel_states = {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}
         invalid_states = {"INVALID"}
         status_shortage = _is_insufficient_balance(status_text) or _is_insufficient_balance(status_payload)
-        if status_text_upper in invalid_states or status_shortage:
-            reason = "[MAKER][BUY] 订单被撮合层标记为 INVALID，尝试调整买入目标后重试。"
-            if status_shortage and status_text_upper not in invalid_states:
-                reason = "[MAKER][BUY] 订单状态提示余额不足，批量撤单后退出。"
+        if status_text_upper in invalid_states:
+            if active_order:
+                _cancel_order(client, active_order)
+                rec = records.get(active_order)
+                if rec is not None:
+                    rec["status"] = "CANCELLED"
+            active_order = None
+            active_price = None
+            goal_size = max(goal_size - max(tick, _MIN_FILL_EPS), 0.0)
+            remaining = max(goal_size - filled_total, 0.0)
+            print("[MAKER][BUY] 订单被撮合层标记为 INVALID，尝试调整买入目标后重试。")
+            continue
+        if status_shortage:
+            reason = "[MAKER][BUY] 订单状态提示余额不足，批量撤单后退出。"
             should_stop = _abort_due_to_balance(reason)
             if should_stop:
                 break
