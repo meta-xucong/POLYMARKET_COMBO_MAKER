@@ -39,8 +39,10 @@ from Volatility_arbitrage_strategy import (
 )
 from maker_execution import (
     maker_buy_follow_bid,
+    maker_multi_buy_follow_bid,
     maker_sell_follow_ask_with_floor_wait,
 )
+from trading.execution import ExecutionConfig, load_default_config
 
 # ========== 1) Client：优先 ws 版，回退 rest 版 ==========
 def _get_client():
@@ -1458,6 +1460,17 @@ def main():
         return
     print("[INIT] API 凭证已验证。")
     print("[INIT] ClobClient 就绪。")
+    try:
+        exec_config = load_default_config()
+        configured_submarkets = exec_config.submarkets
+        if configured_submarkets:
+            print(
+                f"[INIT] 已从 config/trading.yaml 读取 {len(configured_submarkets)} 个子市场，将在买入时轮询下单。"
+            )
+    except Exception as exc:
+        print(f"[WARN] 执行配置加载失败，将回退到单一子市场流程：{exc}")
+        exec_config = ExecutionConfig()
+        configured_submarkets = []
     timezone_override_hint: Optional[Any] = None
     manual_deadline_override_ts: Optional[float] = None
     manual_deadline_disabled = False
@@ -2750,15 +2763,40 @@ def main():
 
             if awaiting_buy_passthrough:
                 awaiting_buy_passthrough = False
+            active_submarkets = configured_submarkets or [
+                {"id": token_id, "name": title or token_id}
+            ]
+            primary_token_id = str(token_id)
+
+            submarket_for_best_bid: Optional[str] = None
+            if len(active_submarkets) == 1:
+                entry = active_submarkets[0]
+                if isinstance(entry, dict):
+                    submarket_for_best_bid = (
+                        entry.get("id")
+                        or entry.get("token_id")
+                        or entry.get("market_id")
+                    )
+                else:
+                    submarket_for_best_bid = entry
+                if submarket_for_best_bid is not None:
+                    submarket_for_best_bid = str(submarket_for_best_bid)
+
+            best_bid_for_submarkets = (
+                _latest_best_bid
+                if submarket_for_best_bid and submarket_for_best_bid == primary_token_id
+                else None
+            )
+
             try:
-                buy_resp = maker_buy_follow_bid(
+                buy_summary = maker_multi_buy_follow_bid(
                     client=client,
-                    token_id=token_id,
+                    submarkets=active_submarkets,
                     target_size=order_size,
                     poll_sec=10.0,
                     min_quote_amt=1.0,
                     min_order_size=API_MIN_ORDER_SIZE,
-                    best_bid_fn=_latest_best_bid,
+                    best_bid_fn=best_bid_for_submarkets,
                     stop_check=stop_event.is_set,
                     external_fill_probe=_buy_fill_delta_probe,
                     progress_probe=_buy_progress_probe,
@@ -2769,10 +2807,26 @@ def main():
                 strategy.on_reject(str(exc))
                 buy_cooldown_until = time.time() + short_buy_cooldown
                 continue
-            print(f"[TRADE][BUY][MAKER] resp={buy_resp}")
-            buy_status = str(buy_resp.get("status") or "").upper()
-            filled_amt = float(buy_resp.get("filled") or 0.0)
-            avg_price = buy_resp.get("avg_price")
+
+            def _primary_buy_result(summary: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+                if not isinstance(summary, dict):
+                    return {}
+                if primary_token_id in summary:
+                    payload = summary.get(primary_token_id) or {}
+                    result = payload.get("result") if isinstance(payload, dict) else None
+                    return result if isinstance(result, dict) else (payload if isinstance(payload, dict) else {})
+                first = next(iter(summary.values()), {})
+                if isinstance(first, dict):
+                    if "result" in first and isinstance(first.get("result"), dict):
+                        return first["result"]
+                    return first
+                return {}
+
+            primary_resp = _primary_buy_result(buy_summary)
+            print(f"[TRADE][BUY][MAKER] summary={buy_summary}")
+            buy_status = str(primary_resp.get("status") or "").upper()
+            filled_amt = float(primary_resp.get("filled") or 0.0)
+            avg_price = primary_resp.get("avg_price")
             if filled_amt > 0:
                 fallback_price = float(avg_price if avg_price is not None else ref_price)
                 prior_position = float(position_size or 0.0)
@@ -2825,7 +2879,7 @@ def main():
                     f"[STATE] 买入成交 -> status={buy_status or 'N/A'} price={fill_px:.4f} size={position_size:.4f}"
                 )
             else:
-                reason_text = str(buy_resp)
+                reason_text = str(primary_resp)
                 print(f"[WARN] 买入未成交(status={buy_status or 'N/A'})：{reason_text}")
                 strategy.on_reject(reason_text)
             buy_cooldown_until = time.time() + short_buy_cooldown
