@@ -25,6 +25,7 @@ class DummyClient:
         self.order_status: Dict[str, Deque[Dict[str, object]]] = {}
         self.created_orders: List[Dict[str, object]] = []
         self.cancelled: List[str] = []
+        self.batch_cancelled: bool = False
         self._counter = 0
 
     def create_order(self, payload: Dict[str, object]) -> Dict[str, object]:
@@ -51,6 +52,9 @@ class DummyClient:
         if seq is not None:
             last = seq[-1] if seq else {"filledAmount": 0.0}
             seq.append({"status": "CANCELLED", "filledAmount": last.get("filledAmount", 0.0)})
+
+    def cancel_open_orders(self) -> None:
+        self.batch_cancelled = True
 
 
 class InsufficientBalanceClient(DummyClient):
@@ -212,7 +216,7 @@ def test_maker_buy_retries_after_invalid_status():
     assert client.created_orders[1]["size"] < client.created_orders[0]["size"]
 
 
-def test_maker_buy_shrinks_on_balance_error_during_create():
+def test_maker_buy_stops_on_balance_error_during_create():
     client = InsufficientBalanceClient(
         status_sequences=[[{"status": "FILLED", "filledAmount": 0.2999, "avgPrice": 0.5}]],
         fail_threshold=0.29995,
@@ -230,10 +234,11 @@ def test_maker_buy_shrinks_on_balance_error_during_create():
         sleep_fn=lambda _: None,
     )
 
-    assert result["status"] == "FILLED"
-    assert result["filled"] == pytest.approx(0.2999, rel=0, abs=1e-9)
-    assert client.failures == 1, "expected one balance-related failure before retry"
-    assert len(client.created_orders) == 1
+    assert result["status"] == "INSUFFICIENT_BALANCE"
+    assert result["filled"] == pytest.approx(0.0)
+    assert client.failures == 1, "expected one balance-related failure before abort"
+    assert len(client.created_orders) == 0
+    assert client.batch_cancelled is True
 
 
 def test_maker_buy_retries_on_insufficient_balance_status():
@@ -256,10 +261,10 @@ def test_maker_buy_retries_on_insufficient_balance_status():
         sleep_fn=lambda _: None,
     )
 
-    assert result["status"] == "FILLED"
-    assert result["filled"] == pytest.approx(0.1499, rel=0, abs=1e-9)
-    assert len(client.created_orders) == 2
-    assert client.cancelled, "Expected balance-related rejection to trigger cancellation"
+    assert result["status"] == "INSUFFICIENT_BALANCE"
+    assert result["filled"] == pytest.approx(0.0)
+    assert len(client.created_orders) == 1
+    assert client.batch_cancelled is True
 
 
 def test_maker_sell_waits_for_floor_before_order():
