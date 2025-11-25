@@ -2464,6 +2464,8 @@ def main():
         nonlocal submarket_order_tracker
         tracker: Dict[str, Dict[str, Any]] = {}
         for market_id, payload in summary.items():
+            if str(market_id).startswith("_"):
+                continue
             if not isinstance(payload, dict):
                 continue
             result = payload.get("result") if isinstance(payload.get("result"), dict) else payload
@@ -2892,11 +2894,16 @@ def main():
             def _primary_buy_result(summary: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
                 if not isinstance(summary, dict):
                     return {}
-                if primary_token_id in summary:
-                    payload = summary.get(primary_token_id) or {}
+                cleaned = {
+                    key: value
+                    for key, value in summary.items()
+                    if not str(key).startswith("_")
+                }
+                if primary_token_id in cleaned:
+                    payload = cleaned.get(primary_token_id) or {}
                     result = payload.get("result") if isinstance(payload, dict) else None
                     return result if isinstance(result, dict) else (payload if isinstance(payload, dict) else {})
-                first = next(iter(summary.values()), {})
+                first = next(iter(cleaned.values()), {})
                 if isinstance(first, dict):
                     if "result" in first and isinstance(first.get("result"), dict):
                         return first["result"]
@@ -2906,9 +2913,23 @@ def main():
             primary_resp = _primary_buy_result(buy_summary)
             print(f"[TRADE][BUY][MAKER] summary={buy_summary}")
             _record_submarket_orders(buy_summary)
+            summary_meta = buy_summary.get("_meta") if isinstance(buy_summary, dict) else {}
             buy_status = str(primary_resp.get("status") or "").upper()
             filled_amt = float(primary_resp.get("filled") or 0.0)
             avg_price = primary_resp.get("avg_price")
+            if isinstance(summary_meta, dict):
+                frozen_markets = summary_meta.get("price_frozen_markets") or []
+                if frozen_markets:
+                    frozen_display = ", ".join([str(x) for x in frozen_markets])
+                    print(
+                        f"[MAKER][BUY] 价格冻结保护触发，冻结子市场: {frozen_display}"
+                    )
+                aggregated_balance_ok = summary_meta.get("balance_ok")
+                if aggregated_balance_ok is False and buy_status != "INSUFFICIENT_BALANCE":
+                    print("[EXIT][BUY] 子市场轮询检测到余额不足，脚本将退出主循环。")
+                    strategy.stop("insufficient balance across submarkets")
+                    stop_event.set()
+                    break
             if buy_status == "INSUFFICIENT_BALANCE":
                 print("[EXIT][BUY] 检测到余额不足且已执行批量撤单，脚本将退出主循环。")
                 strategy.stop("insufficient balance")

@@ -427,5 +427,7 @@ def test_multi_buy_runs_for_each_submarket(monkeypatch):
     results = maker.maker_multi_buy_follow_bid(object(), submarkets, target_size=1.0)
 
     assert calls == ["aaa", "bbb"]
-    assert set(results.keys()) == {"aaa", "bbb"}
+    assert set(results.keys()) == {"aaa", "bbb", "_meta"}
     assert results["bbb"]["name"] == "B label"
+    assert results.get("_meta", {}).get("balance_ok") is True
+    assert "FILLED" in (results.get("_meta", {}).get("states") or [])
