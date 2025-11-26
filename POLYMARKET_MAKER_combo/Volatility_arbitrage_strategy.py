@@ -454,6 +454,11 @@ class VolArbStrategy:
         self._awaiting = None
         self._last_reject_reason = reason
 
+    def mark_awaiting(self, action: Optional[ActionType]) -> None:
+        """显式设置等待状态（用于外部状态同步时标记 SELL 等流程）。"""
+
+        self._awaiting = action
+
     def stop(self, reason: Optional[str] = None) -> None:
         """手动暂停策略或在市场关闭时调用。"""
         self._manual_stop = True
