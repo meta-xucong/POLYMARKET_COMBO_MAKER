@@ -1415,7 +1415,34 @@ class _WsBestBidTracker:
         return None
 
     def _on_event(self, event: Dict[str, Any]) -> None:
-        token_id = self._extract_token_id(event) if isinstance(event, dict) else None
+        """Handle raw WS events and capture best bid by token.
+
+        The WS ``market`` channel usually wraps updates in a ``price_changes``
+        array (``{"event_type": "price_change", "price_changes": [...]}``).
+        The original脚本会下钻这个列表逐条提取 ``asset_id``，而新版最初版本仅尝试
+        在顶层查找 ``token_id``，导致无法从行情事件中拿到买一价。这里复刻原版行
+        为：优先遍历 ``price_changes``，否则退回直接解析顶层事件。
+        """
+
+        if not isinstance(event, dict):
+            return
+
+        # 优先处理 price_changes 列表（与原版一致）。
+        if event.get("event_type") == "price_change" or "price_changes" in event:
+            changes = event.get("price_changes", [])
+            for pc in changes if isinstance(changes, list) else []:
+                token_id = self._extract_token_id(pc)
+                if not token_id:
+                    continue
+                sample = _extract_best_price(pc, "bid")
+                if sample is None:
+                    continue
+                with self._lock:
+                    self._best[token_id] = float(sample.price)
+            return
+
+        # 兜底：尝试直接从事件顶层提取。
+        token_id = self._extract_token_id(event)
         if not token_id:
             return
         sample = _extract_best_price(event, "bid")
