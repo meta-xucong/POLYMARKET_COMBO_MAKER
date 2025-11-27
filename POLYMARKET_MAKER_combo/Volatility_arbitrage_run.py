@@ -1245,14 +1245,14 @@ def _pick_market_subquestion(markets: List[dict]) -> dict:
         url = f"https://polymarket.com/market/{mslug}" if mslug else "(no slug)"
         print(f"  [{i}] {title}  (end={end_ts})  -> {url}")
     while True:
-        s = input("请输入序号或粘贴URL：").strip()
+        s = input("请输入序号或粘贴URL（直接回车返回列表重选）：").strip()
         if s.startswith(("http://", "https://")):
             return {"__direct_url__": s}
         if s.isdigit():
             idx = int(s)
             if 0 <= idx < len(markets):
                 return markets[idx]
-        print("请输入有效序号或URL。")
+        print("请输入有效序号或URL，或重新查看上方列表。")
 
 
 def _pick_market_subquestions(markets: List[dict]) -> List[dict]:
@@ -1268,14 +1268,14 @@ def _pick_market_subquestions(markets: List[dict]) -> List[dict]:
         print(f"  [{i}] {title}  (end={end_ts})  -> {url}")
 
     while True:
-        raw = input("请输入序号列表或URL：").strip()
+        raw = input("请输入序号列表或URL（回车重新查看上方列表，all 为全选）：").strip()
         if raw.startswith(("http://", "https://")):
             return [{"__direct_url__": raw}]
         if raw.lower() == "all":
             return markets
         parts = [p.strip() for p in raw.split(",") if p.strip()]
         if not parts:
-            print("请输入有效序号或URL。")
+            print("请输入有效序号或URL，或输入 all 快速全选。")
             continue
         indices: List[int] = []
         valid = True
@@ -1289,7 +1289,7 @@ def _pick_market_subquestions(markets: List[dict]) -> List[dict]:
                 break
             indices.append(idx)
         if not valid:
-            print("请输入有效序号或URL。")
+            print("请输入有效序号或URL，可用逗号分隔多个序号。")
             continue
         # 去重保持顺序
         seen = set()
@@ -1349,18 +1349,19 @@ def _token_entries_from_market(m: dict) -> List[Dict[str, str]]:
 def _prompt_token_selection(candidates: List[Dict[str, str]]) -> List[Dict[str, str]]:
     if not candidates:
         return []
-    print("[CHOICE] 请选择需要买入的子问题/方向（可多选，输入 all 全选）：")
+    print("[CHOICE] 请选择需要买入的子问题/方向：")
+    print("  - 支持多选，输入序号可用逗号分隔；输入 all 或直接回车默认全选。")
     for i, entry in enumerate(candidates):
         name = entry.get("name") or entry.get("title") or entry.get("id")
         token_id = entry.get("id") or ""
         print(f"  [{i}] {name} -> token_id={token_id}")
     while True:
-        raw = input("请输入序号列表：").strip()
+        raw = input("请输入序号列表（all/回车全选）：").strip()
         if raw.lower() in {"", "all"}:
             return candidates
         parts = [p.strip() for p in raw.split(",") if p.strip()]
         if not parts:
-            print("请输入有效序号。")
+            print("请输入有效序号，可参考上方序号列表或直接回车全选。")
             continue
         indices: List[int] = []
         valid = True
@@ -1374,7 +1375,7 @@ def _prompt_token_selection(candidates: List[Dict[str, str]]) -> List[Dict[str, 
                 break
             indices.append(idx)
         if not valid:
-            print("请输入有效序号。")
+            print("请输入有效序号，可用逗号分隔多个数字。")
             continue
         seen = set()
         selected: List[Dict[str, str]] = []
@@ -1626,7 +1627,12 @@ def main():
     print("[INIT] API 凭证已验证。")
     print("[INIT] ClobClient 就绪。")
 
-    print('请输入 Polymarket 市场 URL（支持事件页可多选子问题）：')
+    print(
+        "请输入 Polymarket 市场 URL（支持事件页可多选子问题）：",
+        "\n  - 可粘贴 /event/... 事件页一次性选择多个子问题，或直接粘贴 /market/... 单一子问题；",
+        "\n  - 也支持直接输入事件 slug 或市场 slug（如 event-xxx 或 market-xxx）。",
+        sep="",
+    )
     source = input().strip()
     if not source:
         print("[ERR] 未输入，退出。")
@@ -1674,6 +1680,12 @@ def main():
     if not chosen_tokens:
         print("[ERR] 未选择任何 token，退出。")
         return
+
+    print("[INFO] 已选择以下子问题/方向，将按统一份数依次买入：")
+    for idx, entry in enumerate(chosen_tokens):
+        name = entry.get("name") or entry.get("title") or entry.get("id") or ""
+        token_id = entry.get("id") or entry.get("token_id") or entry.get("market_id") or ""
+        print(f"  [{idx}] {name} -> token_id={token_id}")
 
     token_id_list = [
         str(entry.get("id") or entry.get("token_id") or entry.get("market_id") or "").strip()
