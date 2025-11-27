@@ -815,6 +815,7 @@ def maker_multi_buy_follow_bid(
     target_size: float,
     *,
     state_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    best_bid_fns: Optional[Mapping[str, Callable[[], Optional[float]]]] = None,
     **kwargs: Any,
 ) -> Dict[str, Dict[str, Any]]:
     """在多个子市场按相同逻辑挂买单。
@@ -824,6 +825,8 @@ def maker_multi_buy_follow_bid(
         submarkets: 子市场配置，支持字符串或包含 ``id``/``token_id``/``market_id`` 的字典。
         target_size: 每个子市场的目标买入数量。
         state_callback: 可选的状态回调，用于跟踪整体进度。
+        best_bid_fns: 按 token_id 提供的买一价回调映射（优先于 **kwargs 中的
+            ``best_bid_fn``），便于结合 WS 价格源按子问题传入。
         **kwargs: 透传给 :func:`maker_buy_follow_bid` 的其余参数。
 
     Returns:
@@ -885,12 +888,17 @@ def maker_multi_buy_follow_bid(
             _emit_state()
 
         try:
+            per_market_kwargs = dict(kwargs)
+            if best_bid_fns is not None:
+                best_fn = best_bid_fns.get(market_id) if isinstance(best_bid_fns, Mapping) else None
+                if best_fn is not None:
+                    per_market_kwargs["best_bid_fn"] = best_fn
             result = maker_buy_follow_bid(
                 client,
                 token_id=market_id,
                 target_size=target_size,
                 state_callback=_per_market_state,
-                **kwargs,
+                **per_market_kwargs,
             )
         except Exception as exc:
             summary[market_id] = {

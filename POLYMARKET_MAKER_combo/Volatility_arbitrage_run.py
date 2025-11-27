@@ -13,7 +13,8 @@ import re
 import hmac
 import hashlib
 import json
-from typing import Dict, Any, Tuple, List, Optional
+from typing import Dict, Any, Tuple, List, Optional, Callable
+import threading
 from decimal import Decimal, ROUND_UP, ROUND_DOWN
 import requests
 from datetime import datetime, timezone, timedelta, date, time as dtime
@@ -26,7 +27,12 @@ except Exception:  # pragma: no cover - 兼容无 zoneinfo 的环境
         pass
 from maker_execution import (
     maker_multi_buy_follow_bid,
+    _extract_best_price,
 )
+try:
+    from Volatility_arbitrage_main_ws import ws_watch_by_ids
+except Exception:
+    ws_watch_by_ids = None
 
 # ========== 1) Client：优先 ws 版，回退 rest 版 ==========
 def _get_client():
@@ -1379,6 +1385,81 @@ def _prompt_token_selection(candidates: List[Dict[str, str]]) -> List[Dict[str, 
             selected.append(candidates[idx])
         return selected
 
+
+class _WsBestBidTracker:
+    """轻量级 WS 订阅器，用于追踪子问题的实时买一价。"""
+
+    def __init__(self, token_ids: List[str]):
+        self.token_ids = [str(tid).strip() for tid in token_ids if tid]
+        self._best: Dict[str, float] = {}
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._error: Optional[Exception] = None
+
+    def _extract_token_id(self, payload: Dict[str, Any]) -> Optional[str]:
+        if not isinstance(payload, dict):
+            return None
+        for key in (
+            "token_id",
+            "tokenId",
+            "id",
+            "market_id",
+            "marketId",
+            "asset_id",
+            "assetId",
+        ):
+            val = payload.get(key)
+            if val:
+                return str(val)
+        return None
+
+    def _on_event(self, event: Dict[str, Any]) -> None:
+        token_id = self._extract_token_id(event) if isinstance(event, dict) else None
+        if not token_id:
+            return
+        sample = _extract_best_price(event, "bid")
+        if sample is None:
+            return
+        with self._lock:
+            self._best[token_id] = float(sample.price)
+
+    def start(self) -> bool:
+        if ws_watch_by_ids is None:
+            return False
+        if not self.token_ids:
+            return False
+
+        def _runner():
+            try:
+                ws_watch_by_ids(
+                    self.token_ids,
+                    label="maker-best-bid",
+                    on_event=self._on_event,
+                    verbose=False,
+                    stop_event=self._stop,
+                )
+            except Exception as exc:  # pragma: no cover - 依赖网络环境
+                self._error = exc
+
+        self._thread = threading.Thread(target=_runner, daemon=True)
+        self._thread.start()
+        return True
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+    def best_bid(self, token_id: str) -> Optional[float]:
+        tid = str(token_id).strip()
+        with self._lock:
+            return self._best.get(tid)
+
+    @property
+    def error(self) -> Optional[Exception]:
+        return self._error
+
 def _looks_like_event_source(source: str) -> bool:
     """Return True when *source* clearly refers to an event rather than a market."""
 
@@ -1567,6 +1648,27 @@ def main():
         print("[ERR] 未选择任何 token，退出。")
         return
 
+    token_id_list = [
+        str(entry.get("id") or entry.get("token_id") or entry.get("market_id") or "").strip()
+        for entry in chosen_tokens
+    ]
+
+    tracker: Optional[_WsBestBidTracker] = None
+    best_bid_fns: Optional[Dict[str, Callable[[], Optional[float]]]] = None
+    if ws_watch_by_ids is not None:
+        tracker = _WsBestBidTracker(token_id_list)
+        if tracker.start():
+            best_bid_fns = {tid: (lambda tid=tid: tracker.best_bid(tid)) for tid in token_id_list}
+            print("[INFO] 已启动 WS 行情订阅，优先使用实时买一价。")
+        else:
+            tracker = None
+            if not any(token_id_list):
+                print("[WARN] 未发现可订阅的 token_id，跳过 WS 行情。")
+            else:
+                print("[WARN] WS 行情订阅未启动，继续尝试 REST 报价。")
+    else:
+        print("[WARN] WS 行情模块不可用，继续尝试 REST 报价。")
+
     print("请输入每个子问题的买入份数（留空则默认按 1 份执行）：")
     size_raw = input().strip()
     target_size: float = 1.0
@@ -1615,10 +1717,16 @@ def main():
             min_order_size=API_MIN_ORDER_SIZE,
             progress_probe_interval=10.0,
             state_callback=_print_state,
+            best_bid_fns=best_bid_fns,
         )
     except Exception as exc:
         print(f"[ERR] 下单过程中出现异常：{exc}")
         return
+    finally:
+        if tracker is not None:
+            tracker.stop()
+            if tracker.error:
+                print(f"[WARN] WS 行情订阅发生异常：{tracker.error}")
 
     print("[TRADE][BUY][MAKER] 组合下单完成，摘要：")
     for mid, payload in summary.items():
