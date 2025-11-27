@@ -387,6 +387,7 @@ def maker_buy_follow_bid(
 
     active_order: Optional[str] = None
     active_price: Optional[float] = None
+    missing_orderbook_count = 0
 
     final_status = "PENDING"
     base_price_dp = BUY_PRICE_DP if price_dp is None else max(int(price_dp), 0)
@@ -539,10 +540,27 @@ def maker_buy_follow_bid(
                 break
             bid_info = _best_bid_info(client, token_id, best_bid_fn)
             if bid_info is None:
+                missing_orderbook_count += 1
+                if state_callback:
+                    _emit_state("NO_ORDERBOOK")
+                if missing_orderbook_count >= 6:
+                    print(
+                        "[MAKER][BUY] 连续 6 次获取订单簿失败，未能找到买一价，终止买入。"
+                    )
+                    final_status = "NO_ORDERBOOK"
+                    break
                 sleep_fn(poll_sec)
                 continue
+            missing_orderbook_count = 0
             bid = bid_info.price
             if bid <= 0:
+                missing_orderbook_count += 1
+                if state_callback:
+                    _emit_state("NO_BID")
+                if missing_orderbook_count >= 6:
+                    print("[MAKER][BUY] 连续 6 次买一价为 0，终止买入。")
+                    final_status = "NO_BID"
+                    break
                 sleep_fn(poll_sec)
                 continue
             _maybe_update_price_dp(bid_info.decimals)
