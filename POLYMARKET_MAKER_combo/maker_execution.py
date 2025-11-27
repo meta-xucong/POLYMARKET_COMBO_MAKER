@@ -543,12 +543,11 @@ def maker_buy_follow_bid(
                 missing_orderbook_count += 1
                 if state_callback:
                     _emit_state("NO_ORDERBOOK")
-                if missing_orderbook_count >= 6:
+                if missing_orderbook_count in {6, 12, 24, 48}:
                     print(
-                        "[MAKER][BUY] 连续 6 次获取订单簿失败，未能找到买一价，终止买入。"
+                        "[MAKER][BUY] 已连续 %d 次无法获取订单簿，继续等待报价…"
+                        % missing_orderbook_count
                     )
-                    final_status = "NO_ORDERBOOK"
-                    break
                 sleep_fn(poll_sec)
                 continue
             missing_orderbook_count = 0
@@ -557,10 +556,11 @@ def maker_buy_follow_bid(
                 missing_orderbook_count += 1
                 if state_callback:
                     _emit_state("NO_BID")
-                if missing_orderbook_count >= 6:
-                    print("[MAKER][BUY] 连续 6 次买一价为 0，终止买入。")
-                    final_status = "NO_BID"
-                    break
+                if missing_orderbook_count in {6, 12, 24, 48}:
+                    print(
+                        "[MAKER][BUY] 已连续 %d 次买一价为 0，继续等待报价…"
+                        % missing_orderbook_count
+                    )
                 sleep_fn(poll_sec)
                 continue
             _maybe_update_price_dp(bid_info.decimals)
