@@ -356,6 +356,7 @@ def maker_buy_follow_bid(
     sleep_fn: Callable[[float], None] = time.sleep,
     progress_probe: Optional[Callable[[], None]] = None,
     progress_probe_interval: float = 60.0,
+    state_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     price_dp: Optional[int] = None,
     external_fill_probe: Optional[Callable[[], Optional[float]]] = None,
 ) -> Dict[str, Any]:
@@ -401,6 +402,20 @@ def maker_buy_follow_bid(
     no_fill_poll_count = 0
 
     next_probe_at = 0.0
+
+    def _emit_state(status_text: Optional[str] = None) -> None:
+        if state_callback is None:
+            return
+        payload = {
+            "token_id": token_id,
+            "status": status_text or final_status,
+            "filled": filled_total,
+            "remaining": max(goal_size - filled_total, 0.0),
+        }
+        try:
+            state_callback(payload)
+        except Exception as exc:
+            print(f"[MAKER][BUY] 状态回调异常：{exc}")
 
     def _maybe_update_price_dp(observed: Optional[int]) -> None:
         nonlocal price_dp_active, tick
@@ -506,6 +521,9 @@ def maker_buy_follow_bid(
         return True
 
     while True:
+        if state_callback and next_probe_at <= 0:
+            _emit_state("PENDING")
+            next_probe_at = time.time() + max(progress_probe_interval, poll_sec, 1e-6)
         if stop_check and stop_check():
             if active_order:
                 _cancel_order(client, active_order)
@@ -586,6 +604,9 @@ def maker_buy_follow_bid(
                 except Exception as probe_exc:
                     print(f"[MAKER][BUY] 进度探针执行异常：{probe_exc}")
                 next_probe_at = time.time() + interval
+            if state_callback:
+                _emit_state("OPEN")
+                next_probe_at = time.time() + max(progress_probe_interval, poll_sec, 1e-6)
             print(
                 f"[MAKER][BUY] 挂单 -> price={px:.{price_dp_active}f} qty={eff_qty:.{BUY_SIZE_DP}f} remaining={remaining:.{BUY_SIZE_DP}f}"
             )
@@ -593,15 +614,17 @@ def maker_buy_follow_bid(
 
         sleep_fn(poll_sec)
         if (
-            progress_probe
-            and active_order
+            active_order
             and progress_probe_interval > 0
             and time.time() >= max(next_probe_at, 0.0)
         ):
-            try:
-                progress_probe()
-            except Exception as probe_exc:
-                print(f"[MAKER][BUY] 进度探针执行异常：{probe_exc}")
+            if progress_probe:
+                try:
+                    progress_probe()
+                except Exception as probe_exc:
+                    print(f"[MAKER][BUY] 进度探针执行异常：{probe_exc}")
+            if state_callback:
+                _emit_state("OPEN")
             interval = max(progress_probe_interval, poll_sec, 1e-6)
             next_probe_at = time.time() + interval
         try:
@@ -694,6 +717,8 @@ def maker_buy_follow_bid(
                     f"filled={filled_amount:.{BUY_SIZE_DP}f} remaining={remaining_slice:.{BUY_SIZE_DP}f} "
                     f"status={status_text_upper}"
                 )
+        if state_callback:
+            _emit_state(status_text_upper)
 
         current_bid_info = _best_bid_info(client, token_id, best_bid_fn)
         current_bid = current_bid_info.price if current_bid_info is not None else None
@@ -756,6 +781,7 @@ def maker_buy_follow_bid(
 
     avg_price = notional_sum / filled_total if filled_total > 0 else None
     remaining = max(goal_size - filled_total, 0.0)
+    _emit_state(final_status)
     return {
         "status": final_status,
         "avg_price": avg_price,
@@ -823,11 +849,29 @@ def maker_multi_buy_follow_bid(
             print("[MAKER][BUY][WARN] 跳过缺少 market/token id 的子市场条目：", entry)
             continue
 
+        def _per_market_state(update: Dict[str, Any]) -> None:
+            nonlocal summary
+            if not isinstance(update, Mapping):
+                return
+            result = summary.get(market_id, {}).get("result") if market_id in summary else {}
+            if not isinstance(result, Mapping):
+                result = {}
+            result = dict(result)
+            if "status" in update:
+                result["status"] = update.get("status")
+            if "filled" in update:
+                result["filled"] = update.get("filled")
+            if "remaining" in update:
+                result["remaining"] = update.get("remaining")
+            summary[market_id] = {"name": label or market_id, "result": result}
+            _emit_state()
+
         try:
             result = maker_buy_follow_bid(
                 client,
                 token_id=market_id,
                 target_size=target_size,
+                state_callback=_per_market_state,
                 **kwargs,
             )
         except Exception as exc:

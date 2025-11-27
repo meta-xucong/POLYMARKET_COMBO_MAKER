@@ -1581,6 +1581,31 @@ def main():
             return
 
     print(f"[RUN] 即将按份数 {target_size} 仅买入 {len(chosen_tokens)} 个子问题…")
+
+    latest_state: Dict[str, Dict[str, Any]] = {}
+    last_state_log = 0.0
+
+    def _print_state(update: Dict[str, Any]) -> None:
+        nonlocal latest_state, last_state_log
+        if not isinstance(update, dict):
+            return
+        markets = update.get("markets") if isinstance(update.get("markets"), dict) else None
+        if markets is None:
+            return
+        latest_state = markets
+        now = time.time()
+        if now - last_state_log < 10.0:
+            return
+        last_state_log = now
+        print("[PROGRESS] 当前买入进度：")
+        for mid, payload in sorted(latest_state.items()):
+            status = payload.get("status") if isinstance(payload, dict) else None
+            filled = payload.get("filled") if isinstance(payload, dict) else None
+            remaining = payload.get("remaining") if isinstance(payload, dict) else None
+            print(
+                f"  token_id={mid} | status={status or 'N/A'} | filled={filled if filled is not None else '-'} | remaining={remaining if remaining is not None else '-'}"
+            )
+
     try:
         summary = maker_multi_buy_follow_bid(
             client,
@@ -1588,6 +1613,8 @@ def main():
             target_size=target_size,
             min_quote_amt=1.0,
             min_order_size=API_MIN_ORDER_SIZE,
+            progress_probe_interval=10.0,
+            state_callback=_print_state,
         )
     except Exception as exc:
         print(f"[ERR] 下单过程中出现异常：{exc}")
