@@ -233,6 +233,8 @@ def _best_price_info(
             val = None
         if val is not None and val > 0:
             return PriceSample(float(val), _infer_price_decimals(val))
+        # 当提供了 best_fn 但暂时拿不到报价时，不回退 REST，以免误用市场元数据里的最小跳价
+        return None
     return _fetch_best_price(client, token_id, side)
 
 

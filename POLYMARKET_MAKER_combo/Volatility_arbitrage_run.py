@@ -1401,13 +1401,13 @@ class _WsBestBidTracker:
         if not isinstance(payload, dict):
             return None
         for key in (
-            "token_id",
-            "tokenId",
-            "id",
-            "market_id",
-            "marketId",
             "asset_id",
             "assetId",
+            "token_id",
+            "tokenId",
+            "market_id",
+            "marketId",
+            "id",
         ):
             val = payload.get(key)
             if val:
@@ -1415,11 +1415,46 @@ class _WsBestBidTracker:
         return None
 
     def _on_event(self, event: Dict[str, Any]) -> None:
-        token_id = self._extract_token_id(event) if isinstance(event, dict) else None
+        if not isinstance(event, dict):
+            return
+
+        def _parse_price_change(pc: Dict[str, Any]) -> Optional[Tuple[str, float]]:
+            tid = self._extract_token_id(pc) if isinstance(pc, dict) else None
+            if not tid:
+                return None
+            bid_val = None
+            for key in ("best_bid", "bestBid", "bid", "highestBid"):
+                val = pc.get(key)
+                if val is None:
+                    continue
+                try:
+                    bid_val = float(val)
+                except (TypeError, ValueError):
+                    continue
+                if bid_val > 0:
+                    break
+            if bid_val is None:
+                return None
+            return tid, bid_val
+
+        # 1) 优先处理 price_change 事件（与 price_watch 逻辑保持一致）
+        if event.get("event_type") == "price_change" or "price_changes" in event:
+            pcs = event.get("price_changes") if isinstance(event.get("price_changes"), list) else []
+            for pc in pcs:
+                parsed = _parse_price_change(pc)
+                if parsed is None:
+                    continue
+                tid, bid_val = parsed
+                with self._lock:
+                    self._best[tid] = bid_val
+            return
+
+        # 2) 退回通用提取逻辑
+        token_id = self._extract_token_id(event)
         if not token_id:
             return
         sample = _extract_best_price(event, "bid")
-        if sample is None:
+        if sample is None or sample.price <= 0:
             return
         with self._lock:
             self._best[token_id] = float(sample.price)
