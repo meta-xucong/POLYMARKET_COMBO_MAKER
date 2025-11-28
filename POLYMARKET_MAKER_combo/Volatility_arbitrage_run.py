@@ -13,6 +13,7 @@ import re
 import hmac
 import hashlib
 import json
+import inspect
 from typing import Dict, Any, Tuple, List, Optional, Callable
 import threading
 from decimal import Decimal, ROUND_UP, ROUND_DOWN
@@ -48,6 +49,24 @@ def _get_client():
         except Exception as e2:
             print("[ERR] 无法导入 get_client：", e1, "|", e2)
             sys.exit(1)
+
+# ========== 1.1) 策略兼容性探测 ==========
+def _strategy_accepts_total_position(strategy: Any) -> bool:
+    """检测 ``strategy.on_buy_filled`` 是否接受 ``total_position`` 参数。"""
+
+    handler = getattr(strategy, "on_buy_filled", None)
+    if handler is None or not callable(handler):
+        return False
+
+    try:
+        signature = inspect.signature(handler)
+    except (TypeError, ValueError):
+        return False
+
+    for param in signature.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+    return "total_position" in signature.parameters
 
 # ========== 2) 保留 price_watch 的单市场解析函数（先尝试） ==========
 try:
