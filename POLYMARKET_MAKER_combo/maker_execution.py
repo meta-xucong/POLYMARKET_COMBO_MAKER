@@ -44,9 +44,8 @@ BUY_SIZE_DP = 6
 SELL_PRICE_DP = 4
 SELL_SIZE_DP = 2
 _MIN_FILL_EPS = 1e-9
-# 默认不再强行套用 5 张的最小下单量，避免在按名义金额（USDC）买入时将份数
-# 误抬到 5 以上，从而偏离用户输入的金额。需要限制时可通过参数单独传入。
-DEFAULT_MIN_ORDER_SIZE = 0.0
+# 官方文档要求 size 不能低于 5，默认遵循该限制；如需其他阈值可通过参数覆写。
+DEFAULT_MIN_ORDER_SIZE = 5.0
 
 
 def _round_up_to_dp(value: float, dp: int) -> float:
@@ -432,6 +431,7 @@ def maker_buy_follow_bid(
     final_status = "PENDING"
     base_price_dp = BUY_PRICE_DP if price_dp is None else max(int(price_dp), 0)
     price_dp_active = base_price_dp
+    size_dp_active = min(price_dp_active, BUY_SIZE_DP)
     tick = _order_tick(price_dp_active)
     # 采用统一的两级缩减步长，先用 0.01，多次失败后升级到 0.1
     size_tick = 0.01
@@ -453,8 +453,8 @@ def maker_buy_follow_bid(
         px = price_hint if price_hint and price_hint > 0 else active_price
         px = px if px and px > 0 else None
         if px is None:
-            return _ceil_to_dp(remaining_quote, BUY_SIZE_DP)
-        return _ceil_to_dp(remaining_quote / px, BUY_SIZE_DP)
+            return _ceil_to_dp(remaining_quote, size_dp_active)
+        return _ceil_to_dp(remaining_quote / px, size_dp_active)
 
     def _emit_state(status_text: Optional[str] = None) -> None:
         if state_callback is None:
@@ -471,12 +471,13 @@ def maker_buy_follow_bid(
             print(f"[MAKER][BUY] 状态回调异常：{exc}")
 
     def _maybe_update_price_dp(observed: Optional[int]) -> None:
-        nonlocal price_dp_active, tick
+        nonlocal price_dp_active, size_dp_active, tick
         if observed is None:
             return
         desired = max(base_price_dp, int(observed))
         if desired != price_dp_active:
             price_dp_active = desired
+            size_dp_active = min(price_dp_active, BUY_SIZE_DP)
             tick = _order_tick(price_dp_active)
             print(f"[MAKER][BUY] 检测到市场价格精度 -> decimals={price_dp_active}")
 
@@ -568,14 +569,14 @@ def maker_buy_follow_bid(
             now = time.monotonic()
         last_shrink_time = now
 
-        shrink_candidate = _ceil_to_dp(max(current_remaining - size_tick, 0.0), BUY_SIZE_DP)
+        shrink_candidate = _ceil_to_dp(max(current_remaining - size_tick, 0.0), size_dp_active)
         min_viable = max(min_viable or 0.0, api_min_qty or 0.0)
         if shrink_candidate > _MIN_FILL_EPS and (
             not min_viable or shrink_candidate + _MIN_FILL_EPS >= min_viable
         ):
             print(
                 "[MAKER][BUY] 重新调整买入目标 -> "
-                f"old={current_remaining:.{BUY_SIZE_DP}f} new={shrink_candidate:.{BUY_SIZE_DP}f}"
+                f"old={current_remaining:.{size_dp_active}f} new={shrink_candidate:.{size_dp_active}f}"
             )
             if use_notional:
                 price_hint = active_price if active_price and active_price > 0 else 1.0
@@ -637,22 +638,29 @@ def maker_buy_follow_bid(
                 continue
             min_qty = 0.0
             if min_quote_amt and min_quote_amt > 0:
-                min_qty = _ceil_to_dp(min_quote_amt / max(px, 1e-9), BUY_SIZE_DP)
+                min_qty = _ceil_to_dp(min_quote_amt / max(px, 1e-9), size_dp_active)
             if use_notional:
                 remaining_quote = max((goal_notional or 0.0) - notional_sum, 0.0)
                 desired_qty = remaining_quote / max(px, 1e-9)
+                if api_min_qty and desired_qty + _MIN_FILL_EPS < api_min_qty:
+                    msg = (
+                        "[MAKER][BUY] 按名义金额倒推出的下单份数 %.6f 低于官方最小下单量 %.6f，终止执行。"
+                        % (desired_qty, api_min_qty)
+                    )
+                    print(msg)
+                    raise SystemExit(msg)
                 eff_qty = max(desired_qty, min_qty, api_min_qty)
-                # 先按 6 位小数向下取整，使 price*size 不至于显著超过目标 quote。
-                eff_qty = _floor_to_dp(eff_qty, BUY_SIZE_DP)
+                # 按市场精度向下取整，使 price*size 不至于显著超过目标 quote。
+                eff_qty = _floor_to_dp(eff_qty, size_dp_active)
                 # 如果下取整后不满足最小下单约束，则再补齐到约束值。
                 min_bound = max(min_qty, api_min_qty)
                 if eff_qty + _MIN_FILL_EPS < min_bound:
-                    eff_qty = _ceil_to_dp(min_bound, BUY_SIZE_DP)
+                    eff_qty = _ceil_to_dp(min_bound, size_dp_active)
             else:
                 eff_qty = max(remaining, min_qty)
                 if api_min_qty:
                     eff_qty = max(eff_qty, api_min_qty)
-                eff_qty = _ceil_to_dp(eff_qty, BUY_SIZE_DP)
+                eff_qty = _ceil_to_dp(eff_qty, size_dp_active)
             if eff_qty <= 0:
                 final_status = "SKIPPED"
                 break
@@ -669,11 +677,31 @@ def maker_buy_follow_bid(
                 response = adapter.create_order(payload)
             except Exception as exc:
                 print(
-                    "[MAKER][BUY] 下单异常，payload=%s decimals=%s use_notional=%s" %
-                    (payload, price_dp_active, use_notional)
+                    "[MAKER][BUY] 下单异常，payload=%s decimals=%s use_notional=%s exc=%r"
+                    % (payload, price_dp_active, use_notional, exc)
                 )
                 min_viable = max(min_qty or 0.0, api_min_qty or 0.0)
-                if _is_insufficient_balance(exc):
+                precision_hint = str(getattr(exc, "args", [None])[0]).lower()
+                precision_error = "precision" in precision_hint or "decimal" in precision_hint
+                if precision_error and price_dp_active < BUY_SIZE_DP:
+                    fallback_qty = _floor_to_dp(eff_qty, size_dp_active)
+                    if fallback_qty + _MIN_FILL_EPS < min_viable:
+                        fallback_qty = _ceil_to_dp(min_viable, size_dp_active)
+                    if fallback_qty > 0:
+                        payload["size"] = fallback_qty
+                        try:
+                            response = adapter.create_order(payload)
+                        except Exception:
+                            raise
+                        eff_qty = fallback_qty
+                        print(
+                            "[MAKER][BUY] 检测到精度相关拒单，按 %d 位小数重试 -> qty=%.6f"
+                            % (price_dp_active, eff_qty)
+                        )
+                        # 成功重试后继续正常流程
+                    else:
+                        raise
+                elif _is_insufficient_balance(exc):
                     should_stop = _handle_balance_shortage(
                         "[MAKER][BUY] 下单失败，疑似余额不足，尝试缩减买入目标后重试。",
                         min_viable,
@@ -682,7 +710,8 @@ def maker_buy_follow_bid(
                     if should_stop:
                         break
                     continue
-                raise
+                else:
+                    raise
             order_id = str(response.get("orderId"))
             record = {
                 "id": order_id,
@@ -711,7 +740,7 @@ def maker_buy_follow_bid(
                 _emit_state("OPEN")
                 next_probe_at = time.time() + max(progress_probe_interval, poll_sec, 1e-6)
             print(
-                f"[MAKER][BUY] 挂单 -> price={px:.{price_dp_active}f} qty={eff_qty:.{BUY_SIZE_DP}f} remaining={remaining:.{BUY_SIZE_DP}f}"
+                f"[MAKER][BUY] 挂单 -> price={px:.{price_dp_active}f} qty={eff_qty:.{size_dp_active}f} remaining={remaining:.{size_dp_active}f}"
             )
             continue
 
@@ -768,13 +797,13 @@ def maker_buy_follow_bid(
             except Exception as probe_exc:
                 print(f"[MAKER][BUY] 外部持仓校对异常：{probe_exc}")
                 external_filled = None
-            if external_filled is not None and external_filled > filled_total + _MIN_FILL_EPS:
-                filled_total = external_filled
-                remaining = _remaining_qty_est(current_bid)
-                print(
-                    f"[MAKER][BUY] 校对持仓后更新累计成交 -> filled={filled_total:.{BUY_SIZE_DP}f} "
-                    f"remaining={remaining:.{BUY_SIZE_DP}f}"
-                )
+                if external_filled is not None and external_filled > filled_total + _MIN_FILL_EPS:
+                    filled_total = external_filled
+                    remaining = _remaining_qty_est(current_bid)
+                    print(
+                        f"[MAKER][BUY] 校对持仓后更新累计成交 -> filled={filled_total:.{size_dp_active}f} "
+                        f"remaining={remaining:.{size_dp_active}f}"
+                    )
         if filled_total > previous_filled_total + _MIN_FILL_EPS:
             no_fill_poll_count = 0
         elif shortage_retry_count > 0:
@@ -794,7 +823,7 @@ def maker_buy_follow_bid(
                 if external_filled is not None and external_filled > filled_total + _MIN_FILL_EPS:
                     filled_total = external_filled
                     print(
-                        f"[MAKER][BUY] 二次校对后更新累计成交 -> filled={filled_total:.{BUY_SIZE_DP}f}"
+                        f"[MAKER][BUY] 二次校对后更新累计成交 -> filled={filled_total:.{size_dp_active}f}"
                     )
             remaining = _remaining_qty_est(current_bid)
             _cancel_order(client, active_order)
@@ -818,7 +847,7 @@ def maker_buy_follow_bid(
             if price_display is not None:
                 print(
                     f"[MAKER][BUY] 挂单状态 -> price={float(price_display):.{price_dp_active}f} "
-                    f"filled={filled_amount:.{BUY_SIZE_DP}f} remaining={remaining_slice:.{BUY_SIZE_DP}f} "
+                    f"filled={filled_amount:.{size_dp_active}f} remaining={remaining_slice:.{size_dp_active}f} "
                     f"status={status_text_upper}"
                 )
         if state_callback:
@@ -830,7 +859,7 @@ def maker_buy_follow_bid(
             _maybe_update_price_dp(current_bid_info.decimals)
         min_buyable = 0.0
         if min_quote_amt and min_quote_amt > 0 and current_bid and current_bid > 0:
-            min_buyable = _ceil_to_dp(min_quote_amt / max(current_bid, 1e-9), BUY_SIZE_DP)
+            min_buyable = _ceil_to_dp(min_quote_amt / max(current_bid, 1e-9), size_dp_active)
         if api_min_qty:
             min_buyable = max(min_buyable, api_min_qty)
 
