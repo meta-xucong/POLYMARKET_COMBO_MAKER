@@ -1681,7 +1681,7 @@ def main():
         print("[ERR] 未选择任何 token，退出。")
         return
 
-    print("[INFO] 已选择以下子问题/方向，将按统一份数依次买入：")
+    print("[INFO] 已选择以下子问题/方向，将按统一金额依次买入：")
     for idx, entry in enumerate(chosen_tokens):
         name = entry.get("name") or entry.get("title") or entry.get("id") or ""
         token_id = entry.get("id") or entry.get("token_id") or entry.get("market_id") or ""
@@ -1708,20 +1708,20 @@ def main():
     else:
         print("[WARN] WS 行情模块不可用，继续尝试 REST 报价。")
 
-    print("请输入每个子问题的买入份数（留空则默认按 1 份执行）：")
+    print("请输入每个子问题的买入金额（USDC，留空则默认按 5 USDC 执行）：")
     size_raw = input().strip()
-    target_size: float = 1.0
+    target_amt: float = 5.0
     if size_raw:
         try:
-            target_size = float(size_raw)
+            target_amt = float(size_raw)
         except Exception:
-            print("[ERR] 份数输入非法，退出。")
+            print("[ERR] 金额输入非法，退出。")
             return
-        if target_size <= 0:
-            print("[ERR] 份数必须大于 0。")
+        if target_amt <= 0:
+            print("[ERR] 金额必须大于 0。")
             return
 
-    print(f"[RUN] 即将按份数 {target_size} 仅买入 {len(chosen_tokens)} 个子问题…")
+    print(f"[RUN] 即将按金额 {target_amt} USDC 仅买入 {len(chosen_tokens)} 个子问题…")
 
     latest_state: Dict[str, Dict[str, Any]] = {}
     last_state_log = 0.0
@@ -1751,7 +1751,7 @@ def main():
         summary = maker_multi_buy_follow_bid(
             client,
             chosen_tokens,
-            target_size=target_size,
+            target_notional=target_amt,
             min_quote_amt=1.0,
             min_order_size=API_MIN_ORDER_SIZE,
             progress_probe_interval=10.0,

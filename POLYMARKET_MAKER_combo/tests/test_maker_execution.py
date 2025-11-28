@@ -417,14 +417,14 @@ def test_maker_sell_shrinks_goal_and_cancels_active_order():
 def test_multi_buy_runs_for_each_submarket(monkeypatch):
     calls: List[str] = []
 
-    def _fake_buy(client, token_id: str, target_size: float, **kwargs: object) -> Dict[str, object]:
+    def _fake_buy(client, token_id: str, target_size: float | None = None, target_notional: float | None = None, **kwargs: object) -> Dict[str, object]:
         calls.append(token_id)
-        return {"status": "FILLED", "token_id": token_id, "filled": target_size}
+        return {"status": "FILLED", "token_id": token_id, "filled": target_notional or target_size}
 
     monkeypatch.setattr(maker, "maker_buy_follow_bid", _fake_buy)
 
     submarkets = ["aaa", {"market_id": "bbb", "name": "B label"}]
-    results = maker.maker_multi_buy_follow_bid(object(), submarkets, target_size=1.0)
+    results = maker.maker_multi_buy_follow_bid(object(), submarkets, target_notional=12.5)
 
     assert calls == ["aaa", "bbb"]
     assert set(results.keys()) == {"aaa", "bbb", "_meta"}

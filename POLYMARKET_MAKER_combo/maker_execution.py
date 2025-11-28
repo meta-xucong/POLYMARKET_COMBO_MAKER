@@ -346,8 +346,9 @@ def _update_fill_totals(
 def maker_buy_follow_bid(
     client: Any,
     token_id: str,
-    target_size: float,
+    target_size: Optional[float] = None,
     *,
+    target_notional: Optional[float] = None,
     poll_sec: float = 10.0,
     min_quote_amt: float = 1.0,
     min_order_size: float = DEFAULT_MIN_ORDER_SIZE,
@@ -360,14 +361,25 @@ def maker_buy_follow_bid(
     price_dp: Optional[int] = None,
     external_fill_probe: Optional[Callable[[], Optional[float]]] = None,
 ) -> Dict[str, Any]:
-    """Continuously maintain a maker buy order following the market bid."""
+    """Continuously maintain a maker buy order following the market bid.
 
-    goal_size = max(_ceil_to_dp(float(target_size), BUY_SIZE_DP), 0.0)
+    当 ``target_notional`` 提供时，优先按等额（USDC）买入目标执行，并在报价上
+    行重挂时同步倒推出新的份数，保证每次挂单的名义金额一致；否则退化为按
+    份数执行的旧逻辑。
+    """
+
+    use_notional = target_notional is not None
+    if not use_notional and target_size is None:
+        raise ValueError("must provide either target_notional or target_size")
+
+    goal_notional = max(float(target_notional or 0.0), 0.0) if use_notional else None
+    goal_size = max(_ceil_to_dp(float(target_size or 0.0), BUY_SIZE_DP), 0.0) if not use_notional else 0.0
     api_min_qty = 0.0
     if min_order_size and min_order_size > 0:
         api_min_qty = _ceil_to_dp(float(min_order_size), BUY_SIZE_DP)
-        goal_size = max(goal_size, api_min_qty)
-    if goal_size <= 0:
+        if not use_notional:
+            goal_size = max(goal_size, api_min_qty)
+    if (use_notional and (goal_notional or 0.0) <= 0.0) or (not use_notional and goal_size <= 0):
         return {
             "status": "SKIPPED",
             "avg_price": None,
@@ -404,14 +416,26 @@ def maker_buy_follow_bid(
 
     next_probe_at = 0.0
 
+    def _remaining_qty_est(price_hint: Optional[float]) -> float:
+        if not use_notional:
+            return max(goal_size - filled_total, 0.0)
+        remaining_quote = max((goal_notional or 0.0) - notional_sum, 0.0)
+        if remaining_quote <= 0:
+            return 0.0
+        px = price_hint if price_hint and price_hint > 0 else active_price
+        px = px if px and px > 0 else None
+        if px is None:
+            return _ceil_to_dp(remaining_quote, BUY_SIZE_DP)
+        return _ceil_to_dp(remaining_quote / px, BUY_SIZE_DP)
+
     def _emit_state(status_text: Optional[str] = None) -> None:
         if state_callback is None:
             return
         payload = {
             "token_id": token_id,
             "status": status_text or final_status,
-            "filled": filled_total,
-            "remaining": max(goal_size - filled_total, 0.0),
+            "filled": notional_sum if use_notional else filled_total,
+            "remaining": (max((goal_notional or 0.0) - notional_sum, 0.0) if use_notional else max(goal_size - filled_total, 0.0)),
         }
         try:
             state_callback(payload)
@@ -476,7 +500,7 @@ def maker_buy_follow_bid(
             print(note)
 
     def _handle_balance_shortage(reason: str, min_viable: float) -> bool:
-        nonlocal goal_size, remaining, active_order, active_price, final_status, shortage_retry_count, size_tick, last_shrink_time, min_shrink_interval
+        nonlocal goal_size, goal_notional, remaining, active_order, active_price, final_status, shortage_retry_count, size_tick, last_shrink_time, min_shrink_interval
 
         print(reason)
         min_shrink_interval = max(min_shrink_interval, base_min_shrink_interval)
@@ -487,8 +511,9 @@ def maker_buy_follow_bid(
                 rec["status"] = "CANCELLED"
         active_order = None
         active_price = None
-        current_remaining = max(goal_size - filled_total, 0.0)
-        if current_remaining <= _MIN_FILL_EPS:
+        current_remaining = _remaining_qty_est(active_price)
+        remaining_quote = max((goal_notional or 0.0) - notional_sum, 0.0) if use_notional else None
+        if (not use_notional and current_remaining <= _MIN_FILL_EPS) or (use_notional and remaining_quote is not None and remaining_quote <= _MIN_FILL_EPS):
             final_status = "FILLED" if filled_total > _MIN_FILL_EPS else final_status
             return True
         shortage_retry_count += 1
@@ -514,8 +539,12 @@ def maker_buy_follow_bid(
                 "[MAKER][BUY] 重新调整买入目标 -> "
                 f"old={current_remaining:.{BUY_SIZE_DP}f} new={shrink_candidate:.{BUY_SIZE_DP}f}"
             )
-            goal_size = filled_total + shrink_candidate
-            remaining = max(goal_size - filled_total, 0.0)
+            if use_notional:
+                price_hint = active_price if active_price and active_price > 0 else 1.0
+                goal_notional = notional_sum + shrink_candidate * price_hint
+            else:
+                goal_size = filled_total + shrink_candidate
+            remaining = _remaining_qty_est(active_price)
             return False
         print("[MAKER][BUY] 无法在满足最小下单量的前提下继续缩减，终止买入。")
         final_status = "FILLED_TRUNCATED" if filled_total > _MIN_FILL_EPS else "SKIPPED_TOO_SMALL"
@@ -535,7 +564,7 @@ def maker_buy_follow_bid(
             break
 
         if active_order is None:
-            if api_min_qty and remaining + _MIN_FILL_EPS < api_min_qty:
+            if api_min_qty and not use_notional and remaining + _MIN_FILL_EPS < api_min_qty:
                 final_status = "FILLED_TRUNCATED" if filled_total > _MIN_FILL_EPS else "SKIPPED_TOO_SMALL"
                 break
             bid_info = _best_bid_info(client, token_id, best_bid_fn)
@@ -571,7 +600,12 @@ def maker_buy_follow_bid(
             min_qty = 0.0
             if min_quote_amt and min_quote_amt > 0:
                 min_qty = _ceil_to_dp(min_quote_amt / max(px, 1e-9), BUY_SIZE_DP)
-            eff_qty = max(remaining, min_qty)
+            if use_notional:
+                remaining_quote = max((goal_notional or 0.0) - notional_sum, 0.0)
+                desired_qty = remaining_quote / max(px, 1e-9)
+                eff_qty = max(desired_qty, min_qty)
+            else:
+                eff_qty = max(remaining, min_qty)
             if api_min_qty:
                 eff_qty = max(eff_qty, api_min_qty)
             eff_qty = _ceil_to_dp(eff_qty, BUY_SIZE_DP)
@@ -684,7 +718,7 @@ def maker_buy_follow_bid(
                 external_filled = None
             if external_filled is not None and external_filled > filled_total + _MIN_FILL_EPS:
                 filled_total = external_filled
-                remaining = max(goal_size - filled_total, 0.0)
+                remaining = _remaining_qty_est(current_bid)
                 print(
                     f"[MAKER][BUY] 校对持仓后更新累计成交 -> filled={filled_total:.{BUY_SIZE_DP}f} "
                     f"remaining={remaining:.{BUY_SIZE_DP}f}"
@@ -710,7 +744,7 @@ def maker_buy_follow_bid(
                     print(
                         f"[MAKER][BUY] 二次校对后更新累计成交 -> filled={filled_total:.{BUY_SIZE_DP}f}"
                     )
-            remaining = max(goal_size - filled_total, 0.0)
+            remaining = _remaining_qty_est(current_bid)
             _cancel_order(client, active_order)
             rec = records.get(active_order)
             if rec is not None:
@@ -719,7 +753,7 @@ def maker_buy_follow_bid(
             active_price = None
             no_fill_poll_count = 0
             continue
-        remaining = max(goal_size - filled_total, 0.0)
+        remaining = _remaining_qty_est(current_bid)
         status_text_upper = status_text.upper()
         if record is not None:
             record["filled"] = filled_amount
@@ -748,14 +782,19 @@ def maker_buy_follow_bid(
         if api_min_qty:
             min_buyable = max(min_buyable, api_min_qty)
 
-        if remaining <= _MIN_FILL_EPS or (min_buyable and remaining < min_buyable):
+        remaining_quote = max((goal_notional or 0.0) - notional_sum, 0.0) if use_notional else None
+        if (
+            (not use_notional and remaining <= _MIN_FILL_EPS)
+            or (use_notional and remaining_quote is not None and remaining_quote <= _MIN_FILL_EPS)
+            or (min_buyable and remaining < min_buyable)
+        ):
             if active_order:
                 _cancel_order(client, active_order)
                 rec = records.get(active_order)
                 if rec is not None:
                     rec["status"] = "CANCELLED"
                 active_order = None
-            if remaining <= _MIN_FILL_EPS:
+            if (not use_notional and remaining <= _MIN_FILL_EPS) or (use_notional and remaining_quote is not None and remaining_quote <= _MIN_FILL_EPS):
                 final_status = "FILLED"
             else:
                 final_status = "FILLED_TRUNCATED" if filled_total > _MIN_FILL_EPS else "SKIPPED_TOO_SMALL"
@@ -798,13 +837,15 @@ def maker_buy_follow_bid(
             continue
 
     avg_price = notional_sum / filled_total if filled_total > 0 else None
-    remaining = max(goal_size - filled_total, 0.0)
+    remaining_value = max((goal_notional or 0.0) - notional_sum, 0.0) if use_notional else max(goal_size - filled_total, 0.0)
     _emit_state(final_status)
     return {
         "status": final_status,
         "avg_price": avg_price,
-        "filled": filled_total,
-        "remaining": remaining,
+        "filled": notional_sum if use_notional else filled_total,
+        "remaining": remaining_value,
+        "filled_size": filled_total,
+        "target_notional": goal_notional,
         "orders": orders,
     }
 
@@ -812,8 +853,9 @@ def maker_buy_follow_bid(
 def maker_multi_buy_follow_bid(
     client: Any,
     submarkets: Iterable[Any],
-    target_size: float,
+    target_size: Optional[float] = None,
     *,
+    target_notional: Optional[float] = None,
     state_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     best_bid_fns: Optional[Mapping[str, Callable[[], Optional[float]]]] = None,
     **kwargs: Any,
@@ -823,7 +865,9 @@ def maker_multi_buy_follow_bid(
     Args:
         client: 交易客户端。
         submarkets: 子市场配置，支持字符串或包含 ``id``/``token_id``/``market_id`` 的字典。
-        target_size: 每个子市场的目标买入数量。
+        target_size: 每个子市场的目标买入数量（与 target_notional 二选一）。
+        target_notional: 每个子市场的目标买入名义金额（USDC），会在每次重挂时
+            根据最新买一价倒推份数。
         state_callback: 可选的状态回调，用于跟踪整体进度。
         best_bid_fns: 按 token_id 提供的买一价回调映射（优先于 **kwargs 中的
             ``best_bid_fn``），便于结合 WS 价格源按子问题传入。
@@ -897,6 +941,7 @@ def maker_multi_buy_follow_bid(
                 client,
                 token_id=market_id,
                 target_size=target_size,
+                target_notional=target_notional,
                 state_callback=_per_market_state,
                 **per_market_kwargs,
             )
@@ -913,6 +958,15 @@ def maker_multi_buy_follow_bid(
             "result": result,
         }
         _emit_state()
+
+    states: List[str] = []
+    for mid, payload in summary.items():
+        if mid is None:
+            continue
+        res = payload.get("result") if isinstance(payload, Mapping) else None
+        if isinstance(res, Mapping) and "status" in res:
+            states.append(str(res.get("status")))
+    summary["_meta"] = {"states": states, "balance_ok": True}
 
     return summary
 
