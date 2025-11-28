@@ -44,9 +44,8 @@ BUY_SIZE_DP = 6
 SELL_PRICE_DP = 4
 SELL_SIZE_DP = 2
 _MIN_FILL_EPS = 1e-9
-# 默认不再强行套用 5 张的最小下单量，避免在按名义金额（USDC）买入时将份数
-# 误抬到 5 以上，从而偏离用户输入的金额。需要限制时可通过参数单独传入。
-DEFAULT_MIN_ORDER_SIZE = 0.0
+# 官方文档要求 size 不能低于 5，默认遵循该限制；如需其他阈值可通过参数覆写。
+DEFAULT_MIN_ORDER_SIZE = 5.0
 
 
 def _round_up_to_dp(value: float, dp: int) -> float:
@@ -643,6 +642,13 @@ def maker_buy_follow_bid(
             if use_notional:
                 remaining_quote = max((goal_notional or 0.0) - notional_sum, 0.0)
                 desired_qty = remaining_quote / max(px, 1e-9)
+                if api_min_qty and desired_qty + _MIN_FILL_EPS < api_min_qty:
+                    msg = (
+                        "[MAKER][BUY] 按名义金额倒推出的下单份数 %.6f 低于官方最小下单量 %.6f，终止执行。"
+                        % (desired_qty, api_min_qty)
+                    )
+                    print(msg)
+                    raise SystemExit(msg)
                 eff_qty = max(desired_qty, min_qty, api_min_qty)
                 # 按市场精度向下取整，使 price*size 不至于显著超过目标 quote。
                 eff_qty = _floor_to_dp(eff_qty, size_dp_active)
