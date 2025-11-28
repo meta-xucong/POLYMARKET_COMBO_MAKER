@@ -41,7 +41,9 @@ BUY_SIZE_DP = 4
 SELL_PRICE_DP = 4
 SELL_SIZE_DP = 2
 _MIN_FILL_EPS = 1e-9
-DEFAULT_MIN_ORDER_SIZE = 5.0
+# 默认不再强行套用 5 张的最小下单量，避免在按名义金额（USDC）买入时将份数
+# 误抬到 5 以上，从而偏离用户输入的金额。需要限制时可通过参数单独传入。
+DEFAULT_MIN_ORDER_SIZE = 0.0
 
 
 def _round_up_to_dp(value: float, dp: int) -> float:
@@ -113,12 +115,33 @@ def _infer_price_decimals(value: Any, *, max_dp: int = 6) -> Optional[int]:
 
 
 def _extract_best_price(payload: Any, side: str) -> Optional[PriceSample]:
+    def _is_pending_state(obj: Mapping[str, Any]) -> bool:
+        """Detect pending/initializing states where prices are unreliable."""
+
+        pending_keys = (
+            "state",
+            "status",
+            "market_state",
+            "marketState",
+            "clob_state",
+            "phase",
+        )
+        for key in pending_keys:
+            val = obj.get(key)
+            if isinstance(val, str) and val.strip().lower().startswith("pending"):
+                return True
+        if obj.get("active") is False:
+            return True
+        return False
+
     numeric = _coerce_float(payload)
     if numeric is not None:
         decimals = _infer_price_decimals(payload)
         return PriceSample(float(numeric), decimals)
 
     if isinstance(payload, Mapping):
+        if _is_pending_state(payload):
+            return None
         primary_keys = {
             "bid": (
                 "best_bid",
@@ -360,6 +383,8 @@ def maker_buy_follow_bid(
     state_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     price_dp: Optional[int] = None,
     external_fill_probe: Optional[Callable[[], Optional[float]]] = None,
+    shared_active_prices: Optional[Dict[str, float]] = None,
+    price_update_guard: Optional[Callable[[Mapping[str, float]], bool]] = None,
 ) -> Dict[str, Any]:
     """Continuously maintain a maker buy order following the market bid.
 
@@ -499,7 +524,7 @@ def maker_buy_follow_bid(
             last_shrink_time = time.monotonic()
             print(note)
 
-    def _handle_balance_shortage(reason: str, min_viable: float) -> bool:
+    def _handle_balance_shortage(reason: str, min_viable: float, *, fatal: bool = False) -> bool:
         nonlocal goal_size, goal_notional, remaining, active_order, active_price, final_status, shortage_retry_count, size_tick, last_shrink_time, min_shrink_interval
 
         print(reason)
@@ -511,6 +536,16 @@ def maker_buy_follow_bid(
                 rec["status"] = "CANCELLED"
         active_order = None
         active_price = None
+        if fatal:
+            final_status = "INSUFFICIENT_BALANCE"
+            cancel_all = getattr(client, "cancel_open_orders", None)
+            if callable(cancel_all):
+                try:
+                    cancel_all()
+                except Exception:
+                    pass
+            return True
+
         current_remaining = _remaining_qty_est(active_price)
         remaining_quote = max((goal_notional or 0.0) - notional_sum, 0.0) if use_notional else None
         if (not use_notional and current_remaining <= _MIN_FILL_EPS) or (use_notional and remaining_quote is not None and remaining_quote <= _MIN_FILL_EPS):
@@ -629,6 +664,7 @@ def maker_buy_follow_bid(
                     should_stop = _handle_balance_shortage(
                         "[MAKER][BUY] 下单失败，疑似余额不足，尝试缩减买入目标后重试。",
                         min_viable,
+                        fatal=True,
                     )
                     if should_stop:
                         break
@@ -649,6 +685,8 @@ def maker_buy_follow_bid(
             active_order = order_id
             active_price = px
             _reset_shortage_recovery("[MAKER][BUY] 挂单成功，退出余额不足重试模式。")
+            if shared_active_prices is not None:
+                shared_active_prices[token_id] = float(px)
             if progress_probe:
                 interval = max(progress_probe_interval, poll_sec, 1e-6)
                 try:
@@ -699,6 +737,7 @@ def maker_buy_follow_bid(
         if last_price_hint is None:
             last_price_hint = 0.0
         previous_filled_total = filled_total
+        current_bid: Optional[float] = active_price
 
         filled_amount, avg_price, notional_sum = _update_fill_totals(
             active_order,
@@ -801,6 +840,11 @@ def maker_buy_follow_bid(
             break
 
         if current_bid is not None and active_price is not None and current_bid >= active_price + tick - 1e-12:
+            if shared_active_prices is not None:
+                proposed = dict(shared_active_prices)
+                proposed[token_id] = float(current_bid)
+                if price_update_guard is not None and not price_update_guard(proposed):
+                    continue
             print(
                 f"[MAKER][BUY] 买一上行 -> 撤单重挂 | old={active_price:.{price_dp_active}f} new={current_bid:.{price_dp_active}f}"
             )
@@ -810,6 +854,8 @@ def maker_buy_follow_bid(
                 rec["status"] = "CANCELLED"
             active_order = None
             active_price = None
+            if shared_active_prices is not None:
+                shared_active_prices[token_id] = float(current_bid)
             continue
 
         final_states = {"FILLED", "MATCHED", "COMPLETED", "EXECUTED"}
@@ -823,7 +869,7 @@ def maker_buy_follow_bid(
             if status_shortage and status_text_upper not in invalid_states:
                 reason = "[MAKER][BUY] 订单状态提示余额不足，尝试调整买入目标后重试。"
             min_viable = max(min_buyable or 0.0, api_min_qty or 0.0)
-            should_stop = _handle_balance_shortage(reason, min_viable)
+            should_stop = _handle_balance_shortage(reason, min_viable, fatal=status_shortage)
             if should_stop:
                 break
             continue
