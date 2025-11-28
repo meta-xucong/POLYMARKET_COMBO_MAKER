@@ -48,6 +48,60 @@ _MIN_FILL_EPS = 1e-9
 DEFAULT_MIN_ORDER_SIZE = 5.0
 
 
+class PriceSumArbitrageGuard:
+    """Track working maker prices and stop when the sum crosses the cap.
+
+    该守卫用于跨市场的套利校验：如果所有挂单价格之和达到或超过设定阈值
+    （默认 1.0），则触发停止信号，供上层统一撤单或转入卖出流程。
+    """
+
+    def __init__(self, *, threshold: float = 1.0) -> None:
+        self.threshold = float(threshold)
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._violation_total: Optional[float] = None
+        self.prices: Dict[str, float] = {}
+        self.fills: Dict[str, Dict[str, float]] = {}
+
+    def _mark_violation(self, total: float) -> None:
+        self._violation_total = total
+        self._stop_event.set()
+
+    def should_stop(self) -> bool:
+        return self._stop_event.is_set()
+
+    def violation_total(self) -> Optional[float]:
+        return self._violation_total
+
+    def record_fill(self, token_id: str, filled_size: float, avg_price: Optional[float]) -> None:
+        with self._lock:
+            self.fills[token_id] = {
+                "size": float(filled_size),
+                "avg_price": float(avg_price) if avg_price is not None else 0.0,
+            }
+
+    def clear_price(self, token_id: str) -> None:
+        with self._lock:
+            self.prices.pop(token_id, None)
+
+    def validate_proposed_prices(self, proposed: Mapping[str, float]) -> bool:
+        with self._lock:
+            total = sum(float(v) for v in proposed.values())
+            if total >= self.threshold - 1e-12:
+                self._mark_violation(total)
+                return False
+            return True
+
+    def commit_price(self, token_id: str, price: float) -> bool:
+        with self._lock:
+            self.prices[token_id] = float(price)
+            total = sum(self.prices.values())
+            if total >= self.threshold - 1e-12:
+                self._mark_violation(total)
+                return False
+            return True
+
+
 def _round_up_to_dp(value: float, dp: int) -> float:
     factor = 10 ** dp
     return math.ceil(value * factor - 1e-12) / factor
@@ -387,6 +441,7 @@ def maker_buy_follow_bid(
     external_fill_probe: Optional[Callable[[], Optional[float]]] = None,
     shared_active_prices: Optional[Dict[str, float]] = None,
     price_update_guard: Optional[Callable[[Mapping[str, float]], bool]] = None,
+    price_sum_guard: Optional[PriceSumArbitrageGuard] = None,
 ) -> Dict[str, Any]:
     """Continuously maintain a maker buy order following the market bid.
 
@@ -455,6 +510,11 @@ def maker_buy_follow_bid(
         if px is None:
             return _ceil_to_dp(remaining_quote, size_dp_active)
         return _ceil_to_dp(remaining_quote / px, size_dp_active)
+
+    def _should_stop() -> bool:
+        if price_sum_guard and price_sum_guard.should_stop():
+            return True
+        return bool(stop_check and stop_check())
 
     def _emit_state(status_text: Optional[str] = None) -> None:
         if state_callback is None:
@@ -589,11 +649,25 @@ def maker_buy_follow_bid(
         final_status = "FILLED_TRUNCATED" if filled_total > _MIN_FILL_EPS else "SKIPPED_TOO_SMALL"
         return True
 
+    def _validate_price_cap(price_to_set: Optional[float]) -> bool:
+        proposed: Dict[str, float] = {}
+        if shared_active_prices is not None:
+            proposed.update(shared_active_prices)
+        if price_to_set is None:
+            proposed.pop(token_id, None)
+        else:
+            proposed[token_id] = float(price_to_set)
+        if price_sum_guard and not price_sum_guard.validate_proposed_prices(proposed):
+            return False
+        if price_update_guard and not price_update_guard(proposed):
+            return False
+        return True
+
     while True:
         if state_callback and next_probe_at <= 0:
             _emit_state("PENDING")
             next_probe_at = time.time() + max(progress_probe_interval, poll_sec, 1e-6)
-        if stop_check and stop_check():
+        if _should_stop():
             if active_order:
                 _cancel_order(client, active_order)
                 rec = records.get(active_order)
@@ -664,6 +738,11 @@ def maker_buy_follow_bid(
             if eff_qty <= 0:
                 final_status = "SKIPPED"
                 break
+            if not _validate_price_cap(px):
+                final_status = "STOPPED"
+                if price_sum_guard is not None:
+                    price_sum_guard.commit_price(token_id, px)
+                break
             payload = {
                 "tokenId": token_id,
                 "side": "BUY",
@@ -729,6 +808,8 @@ def maker_buy_follow_bid(
             _reset_shortage_recovery("[MAKER][BUY] 挂单成功，退出余额不足重试模式。")
             if shared_active_prices is not None:
                 shared_active_prices[token_id] = float(px)
+            if price_sum_guard is not None:
+                price_sum_guard.commit_price(token_id, float(px))
             if progress_probe:
                 interval = max(progress_probe_interval, poll_sec, 1e-6)
                 try:
@@ -804,6 +885,8 @@ def maker_buy_follow_bid(
                         f"[MAKER][BUY] 校对持仓后更新累计成交 -> filled={filled_total:.{size_dp_active}f} "
                         f"remaining={remaining:.{size_dp_active}f}"
                     )
+        if price_sum_guard is not None:
+            price_sum_guard.record_fill(token_id, filled_total, avg_price)
         if filled_total > previous_filled_total + _MIN_FILL_EPS:
             no_fill_poll_count = 0
         elif shortage_retry_count > 0:
@@ -882,11 +965,17 @@ def maker_buy_follow_bid(
             break
 
         if current_bid is not None and active_price is not None and current_bid >= active_price + tick - 1e-12:
-            if shared_active_prices is not None:
-                proposed = dict(shared_active_prices)
-                proposed[token_id] = float(current_bid)
-                if price_update_guard is not None and not price_update_guard(proposed):
-                    continue
+            proposed = dict(shared_active_prices) if shared_active_prices is not None else {}
+            proposed[token_id] = float(current_bid)
+            if not _validate_price_cap(proposed.get(token_id)):
+                final_status = "STOPPED"
+                _cancel_order(client, active_order)
+                rec = records.get(active_order)
+                if rec is not None:
+                    rec["status"] = "CANCELLED"
+                active_order = None
+                active_price = None
+                break
             print(
                 f"[MAKER][BUY] 买一上行 -> 撤单重挂 | old={active_price:.{price_dp_active}f} new={current_bid:.{price_dp_active}f}"
             )
@@ -898,6 +987,8 @@ def maker_buy_follow_bid(
             active_price = None
             if shared_active_prices is not None:
                 shared_active_prices[token_id] = float(current_bid)
+            if price_sum_guard is not None:
+                price_sum_guard.commit_price(token_id, float(current_bid))
             continue
 
         final_states = {"FILLED", "MATCHED", "COMPLETED", "EXECUTED"}
@@ -926,6 +1017,10 @@ def maker_buy_follow_bid(
 
     avg_price = notional_sum / filled_total if filled_total > 0 else None
     remaining_value = max((goal_notional or 0.0) - notional_sum, 0.0) if use_notional else max(goal_size - filled_total, 0.0)
+    if shared_active_prices is not None:
+        shared_active_prices.pop(token_id, None)
+    if price_sum_guard is not None:
+        price_sum_guard.clear_price(token_id)
     _emit_state(final_status)
     return {
         "status": final_status,
@@ -967,6 +1062,25 @@ def maker_multi_buy_follow_bid(
 
     summary: Dict[str, Dict[str, Any]] = {}
     lock = threading.Lock()
+    shared_active_prices: Dict[str, float] = {}
+    price_guard = PriceSumArbitrageGuard()
+
+    def _wrap_stop_check(user_stop: Optional[Callable[[], bool]]) -> Callable[[], bool]:
+        def _combined() -> bool:
+            if price_guard.should_stop():
+                return True
+            return bool(user_stop and user_stop())
+
+        return _combined
+
+    def _wrap_price_guard(user_guard: Optional[Callable[[Mapping[str, float]], bool]]):
+        if user_guard is None:
+            return price_guard.validate_proposed_prices
+
+        def _guard(proposed: Mapping[str, float]) -> bool:
+            return price_guard.validate_proposed_prices(proposed) and bool(user_guard(proposed))
+
+        return _guard
 
     def _emit_state_locked() -> None:
         if state_callback is None:
@@ -1029,6 +1143,12 @@ def maker_multi_buy_follow_bid(
 
         try:
             per_market_kwargs = dict(kwargs)
+            user_stop = per_market_kwargs.get("stop_check")
+            per_market_kwargs["stop_check"] = _wrap_stop_check(user_stop)
+            user_guard = per_market_kwargs.get("price_update_guard")
+            per_market_kwargs["price_update_guard"] = _wrap_price_guard(user_guard)
+            per_market_kwargs["shared_active_prices"] = shared_active_prices
+            per_market_kwargs["price_sum_guard"] = price_guard
             if best_bid_fns is not None:
                 best_fn = best_bid_fns.get(market_id) if isinstance(best_bid_fns, Mapping) else None
                 if best_fn is not None:
@@ -1059,6 +1179,39 @@ def maker_multi_buy_follow_bid(
 
     for t in threads:
         t.join()
+
+    if price_guard.should_stop() and price_guard.violation_total() is not None:
+        filled_entries: List[Tuple[str, float, float]] = []
+        for mid, payload in summary.items():
+            if mid is None or mid == "_meta":
+                continue
+            res = payload.get("result") if isinstance(payload, Mapping) else None
+            if not isinstance(res, Mapping):
+                continue
+            filled_size = float(res.get("filled_size") or 0.0)
+            avg_price = _coerce_float(res.get("avg_price"))
+            if avg_price is None:
+                fill_snapshot = price_guard.fills.get(mid)
+                if fill_snapshot is not None:
+                    avg_price = _coerce_float(fill_snapshot.get("avg_price"))
+            if filled_size > _MIN_FILL_EPS and avg_price is not None:
+                filled_entries.append((mid, filled_size, avg_price))
+
+        if not filled_entries:
+            print("此时所有子市场price之和大于1，已不满足套利条件，程序停止")
+            raise SystemExit("arbitrage condition violated")
+
+        for mid, size, avg in filled_entries:
+            floor_px = float(avg) * 1.001
+            maker_sell_follow_ask_with_floor_wait(
+                client,
+                token_id=mid,
+                position_size=size,
+                floor_X=floor_px,
+                min_order_size=kwargs.get("min_order_size", DEFAULT_MIN_ORDER_SIZE),
+            )
+        print("此时所有子市场price之和大于1，已不满足套利条件，现有仓位已全部卖出，程序停止")
+        raise SystemExit("arbitrage condition violated with fills unwound")
 
     states: List[str] = []
     for mid, payload in summary.items():
