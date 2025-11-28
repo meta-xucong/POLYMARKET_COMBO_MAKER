@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import math
 import time
+import threading
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping
 from decimal import Decimal, InvalidOperation
@@ -924,8 +925,9 @@ def maker_multi_buy_follow_bid(
     """
 
     summary: Dict[str, Dict[str, Any]] = {}
+    lock = threading.Lock()
 
-    def _emit_state() -> None:
+    def _emit_state_locked() -> None:
         if state_callback is None:
             return
         snapshot: Dict[str, Dict[str, Any]] = {}
@@ -943,7 +945,26 @@ def maker_multi_buy_follow_bid(
         except Exception as exc:
             print(f"[MAKER][BUY][CALLBACK] 状态回调异常：{exc}")
 
-    for entry in submarkets:
+    def _update_summary(mid: str, payload: Dict[str, Any]) -> None:
+        with lock:
+            existing = summary.get(mid) if isinstance(summary.get(mid), Mapping) else {}
+            name = payload.get("name") or existing.get("name") or mid
+            base_result = existing.get("result") if isinstance(existing, Mapping) else {}
+            if not isinstance(base_result, Mapping):
+                base_result = {}
+            new_result = dict(base_result)
+            update_res = payload.get("result") if isinstance(payload, Mapping) else {}
+            if isinstance(update_res, Mapping):
+                for key in ("status", "filled", "remaining"):
+                    if key in update_res:
+                        new_result[key] = update_res.get(key)
+                for k, v in update_res.items():
+                    if k not in new_result:
+                        new_result[k] = v
+            summary[mid] = {"name": name, "result": new_result}
+            _emit_state_locked()
+
+    def _run_market(entry: Any) -> None:
         market_id: Optional[str] = None
         label: Optional[str] = None
 
@@ -958,24 +979,12 @@ def maker_multi_buy_follow_bid(
 
         if not market_id:
             print("[MAKER][BUY][WARN] 跳过缺少 market/token id 的子市场条目：", entry)
-            continue
+            return
 
         def _per_market_state(update: Dict[str, Any]) -> None:
-            nonlocal summary
             if not isinstance(update, Mapping):
                 return
-            result = summary.get(market_id, {}).get("result") if market_id in summary else {}
-            if not isinstance(result, Mapping):
-                result = {}
-            result = dict(result)
-            if "status" in update:
-                result["status"] = update.get("status")
-            if "filled" in update:
-                result["filled"] = update.get("filled")
-            if "remaining" in update:
-                result["remaining"] = update.get("remaining")
-            summary[market_id] = {"name": label or market_id, "result": result}
-            _emit_state()
+            _update_summary(market_id, {"name": label or market_id, "result": dict(update)})
 
         try:
             per_market_kwargs = dict(kwargs)
@@ -991,19 +1000,24 @@ def maker_multi_buy_follow_bid(
                 state_callback=_per_market_state,
                 **per_market_kwargs,
             )
+            _update_summary(market_id, {"name": label or market_id, "result": result})
         except Exception as exc:
-            summary[market_id] = {
-                "name": label or market_id,
-                "error": str(exc),
-            }
-            _emit_state()
-            continue
+            _update_summary(
+                market_id,
+                {
+                    "name": label or market_id,
+                    "result": {"status": "ERROR", "error": str(exc)},
+                },
+            )
 
-        summary[market_id] = {
-            "name": label or market_id,
-            "result": result,
-        }
-        _emit_state()
+    threads: List[threading.Thread] = []
+    for entry in submarkets:
+        t = threading.Thread(target=_run_market, args=(entry,), daemon=True)
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join()
 
     states: List[str] = []
     for mid, payload in summary.items():
