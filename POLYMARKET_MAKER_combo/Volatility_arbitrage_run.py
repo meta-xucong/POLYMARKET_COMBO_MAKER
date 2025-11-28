@@ -28,7 +28,9 @@ except Exception:  # pragma: no cover - 兼容无 zoneinfo 的环境
 from maker_execution import (
     maker_multi_buy_follow_bid,
     _extract_best_price,
+    _coerce_float,
 )
+from trading.execution import ClobPolymarketAPI
 try:
     from Volatility_arbitrage_main_ws import ws_watch_by_ids
 except Exception:
@@ -1245,14 +1247,14 @@ def _pick_market_subquestion(markets: List[dict]) -> dict:
         url = f"https://polymarket.com/market/{mslug}" if mslug else "(no slug)"
         print(f"  [{i}] {title}  (end={end_ts})  -> {url}")
     while True:
-        s = input("请输入序号或粘贴URL：").strip()
+        s = input("请输入序号或粘贴URL（直接回车返回列表重选）：").strip()
         if s.startswith(("http://", "https://")):
             return {"__direct_url__": s}
         if s.isdigit():
             idx = int(s)
             if 0 <= idx < len(markets):
                 return markets[idx]
-        print("请输入有效序号或URL。")
+        print("请输入有效序号或URL，或重新查看上方列表。")
 
 
 def _pick_market_subquestions(markets: List[dict]) -> List[dict]:
@@ -1268,14 +1270,14 @@ def _pick_market_subquestions(markets: List[dict]) -> List[dict]:
         print(f"  [{i}] {title}  (end={end_ts})  -> {url}")
 
     while True:
-        raw = input("请输入序号列表或URL：").strip()
+        raw = input("请输入序号列表或URL（回车重新查看上方列表，all 为全选）：").strip()
         if raw.startswith(("http://", "https://")):
             return [{"__direct_url__": raw}]
         if raw.lower() == "all":
             return markets
         parts = [p.strip() for p in raw.split(",") if p.strip()]
         if not parts:
-            print("请输入有效序号或URL。")
+            print("请输入有效序号或URL，或输入 all 快速全选。")
             continue
         indices: List[int] = []
         valid = True
@@ -1289,7 +1291,7 @@ def _pick_market_subquestions(markets: List[dict]) -> List[dict]:
                 break
             indices.append(idx)
         if not valid:
-            print("请输入有效序号或URL。")
+            print("请输入有效序号或URL，可用逗号分隔多个序号。")
             continue
         # 去重保持顺序
         seen = set()
@@ -1349,18 +1351,19 @@ def _token_entries_from_market(m: dict) -> List[Dict[str, str]]:
 def _prompt_token_selection(candidates: List[Dict[str, str]]) -> List[Dict[str, str]]:
     if not candidates:
         return []
-    print("[CHOICE] 请选择需要买入的子问题/方向（可多选，输入 all 全选）：")
+    print("[CHOICE] 请选择需要买入的子问题/方向：")
+    print("  - 支持多选，输入序号可用逗号分隔；输入 all 或直接回车默认全选。")
     for i, entry in enumerate(candidates):
         name = entry.get("name") or entry.get("title") or entry.get("id")
         token_id = entry.get("id") or ""
         print(f"  [{i}] {name} -> token_id={token_id}")
     while True:
-        raw = input("请输入序号列表：").strip()
+        raw = input("请输入序号列表（all/回车全选）：").strip()
         if raw.lower() in {"", "all"}:
             return candidates
         parts = [p.strip() for p in raw.split(",") if p.strip()]
         if not parts:
-            print("请输入有效序号。")
+            print("请输入有效序号，可参考上方序号列表或直接回车全选。")
             continue
         indices: List[int] = []
         valid = True
@@ -1374,7 +1377,7 @@ def _prompt_token_selection(candidates: List[Dict[str, str]]) -> List[Dict[str, 
                 break
             indices.append(idx)
         if not valid:
-            print("请输入有效序号。")
+            print("请输入有效序号，可用逗号分隔多个数字。")
             continue
         seen = set()
         selected: List[Dict[str, str]] = []
@@ -1415,7 +1418,34 @@ class _WsBestBidTracker:
         return None
 
     def _on_event(self, event: Dict[str, Any]) -> None:
-        token_id = self._extract_token_id(event) if isinstance(event, dict) else None
+        """Handle raw WS events and capture best bid by token.
+
+        The WS ``market`` channel usually wraps updates in a ``price_changes``
+        array (``{"event_type": "price_change", "price_changes": [...]}``).
+        The original脚本会下钻这个列表逐条提取 ``asset_id``，而新版最初版本仅尝试
+        在顶层查找 ``token_id``，导致无法从行情事件中拿到买一价。这里复刻原版行
+        为：优先遍历 ``price_changes``，否则退回直接解析顶层事件。
+        """
+
+        if not isinstance(event, dict):
+            return
+
+        # 优先处理 price_changes 列表（与原版一致）。
+        if event.get("event_type") == "price_change" or "price_changes" in event:
+            changes = event.get("price_changes", [])
+            for pc in changes if isinstance(changes, list) else []:
+                token_id = self._extract_token_id(pc)
+                if not token_id:
+                    continue
+                sample = _extract_best_price(pc, "bid")
+                if sample is None:
+                    continue
+                with self._lock:
+                    self._best[token_id] = float(sample.price)
+            return
+
+        # 兜底：尝试直接从事件顶层提取。
+        token_id = self._extract_token_id(event)
         if not token_id:
             return
         sample = _extract_best_price(event, "bid")
@@ -1599,7 +1629,12 @@ def main():
     print("[INIT] API 凭证已验证。")
     print("[INIT] ClobClient 就绪。")
 
-    print('请输入 Polymarket 市场 URL（支持事件页可多选子问题）：')
+    print(
+        "请输入 Polymarket 市场 URL（支持事件页可多选子问题）：",
+        "\n  - 可粘贴 /event/... 事件页一次性选择多个子问题，或直接粘贴 /market/... 单一子问题；",
+        "\n  - 也支持直接输入事件 slug 或市场 slug（如 event-xxx 或 market-xxx）。",
+        sep="",
+    )
     source = input().strip()
     if not source:
         print("[ERR] 未输入，退出。")
@@ -1648,6 +1683,12 @@ def main():
         print("[ERR] 未选择任何 token，退出。")
         return
 
+    print("[INFO] 已选择以下子问题/方向，将按统一金额依次买入：")
+    for idx, entry in enumerate(chosen_tokens):
+        name = entry.get("name") or entry.get("title") or entry.get("id") or ""
+        token_id = entry.get("id") or entry.get("token_id") or entry.get("market_id") or ""
+        print(f"  [{idx}] {name} -> token_id={token_id}")
+
     token_id_list = [
         str(entry.get("id") or entry.get("token_id") or entry.get("market_id") or "").strip()
         for entry in chosen_tokens
@@ -1669,20 +1710,20 @@ def main():
     else:
         print("[WARN] WS 行情模块不可用，继续尝试 REST 报价。")
 
-    print("请输入每个子问题的买入份数（留空则默认按 1 份执行）：")
+    print("请输入每个子问题的买入金额（USDC，留空则默认按 5 USDC 执行）：")
     size_raw = input().strip()
-    target_size: float = 1.0
+    target_amt: float = 5.0
     if size_raw:
         try:
-            target_size = float(size_raw)
+            target_amt = float(size_raw)
         except Exception:
-            print("[ERR] 份数输入非法，退出。")
+            print("[ERR] 金额输入非法，退出。")
             return
-        if target_size <= 0:
-            print("[ERR] 份数必须大于 0。")
+        if target_amt <= 0:
+            print("[ERR] 金额必须大于 0。")
             return
 
-    print(f"[RUN] 即将按份数 {target_size} 仅买入 {len(chosen_tokens)} 个子问题…")
+    print(f"[RUN] 即将按金额 {target_amt} USDC 仅买入 {len(chosen_tokens)} 个子问题…")
 
     latest_state: Dict[str, Dict[str, Any]] = {}
     last_state_log = 0.0
@@ -1708,17 +1749,94 @@ def main():
                 f"  token_id={mid} | status={status or 'N/A'} | filled={filled if filled is not None else '-'} | remaining={remaining if remaining is not None else '-'}"
             )
 
+    def _wait_until_orders_done(summary: Dict[str, Any]) -> Dict[str, Any]:
+        terminal_states = {
+            "FILLED",
+            "FILLED_TRUNCATED",
+            "SKIPPED",
+            "SKIPPED_TOO_SMALL",
+            "STOPPED",
+            "CANCELLED",
+            "CANCELED",
+            "REJECTED",
+            "EXPIRED",
+        }
+
+        def _is_terminal(status: Optional[str]) -> bool:
+            if status is None:
+                return False
+            return status.upper() in terminal_states
+
+        adapter = None
+        pending_logged = False
+
+        while True:
+            pending: List[Tuple[str, Dict[str, Any]]] = []
+            for mid, payload in summary.items():
+                if mid == "_meta":
+                    continue
+                res = payload.get("result") if isinstance(payload, dict) else None
+                if not isinstance(res, dict):
+                    continue
+                status_val = res.get("status")
+                orders = res.get("orders") if isinstance(res.get("orders"), list) else []
+                if not _is_terminal(status_val) and orders:
+                    pending.append((mid, res))
+
+            if not pending:
+                break
+
+            if adapter is None:
+                adapter = ClobPolymarketAPI(client)
+            if not pending_logged:
+                print("[WAIT] 订单仍在撮合中，继续等待成交…")
+                pending_logged = True
+
+            for mid, res in pending:
+                orders = res.get("orders") or []
+                filled_snapshot = res.get("filled_size") or res.get("filled") or 0.0
+                final_status = res.get("status") or "PENDING"
+                for order in orders:
+                    oid = order.get("id") if isinstance(order, dict) else None
+                    if not oid:
+                        continue
+                    try:
+                        stat = adapter.get_order_status(str(oid))
+                    except Exception as exc:
+                        print(f"[WARN] 查询订单状态失败（{mid} | {oid}）：{exc}")
+                        continue
+                    st_text = str(stat.get("status", "")).upper()
+                    filled_amt = _coerce_float(stat.get("filledAmount")) or 0.0
+                    order["status"] = st_text or order.get("status")
+                    order["filled"] = filled_amt
+                    if st_text in {"FILLED", "MATCHED", "COMPLETED", "EXECUTED"}:
+                        filled_snapshot = max(filled_snapshot, filled_amt)
+                        final_status = "FILLED"
+                    elif st_text in {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}:
+                        if final_status not in {"FILLED", "FILLED_TRUNCATED"}:
+                            final_status = st_text
+
+                res["filled_size"] = filled_snapshot
+                if "filled" not in res or res.get("filled") is None:
+                    res["filled"] = filled_snapshot
+                res["status"] = final_status
+
+            time.sleep(2.0)
+
+        return summary
+
     try:
         summary = maker_multi_buy_follow_bid(
             client,
             chosen_tokens,
-            target_size=target_size,
+            target_notional=target_amt,
             min_quote_amt=1.0,
             min_order_size=API_MIN_ORDER_SIZE,
             progress_probe_interval=10.0,
             state_callback=_print_state,
             best_bid_fns=best_bid_fns,
         )
+        summary = _wait_until_orders_done(summary)
     except Exception as exc:
         print(f"[ERR] 下单过程中出现异常：{exc}")
         return
