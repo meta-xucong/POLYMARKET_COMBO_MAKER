@@ -59,7 +59,8 @@ except Exception as e:
 CLOB_API_HOST = "https://clob.polymarket.com"
 GAMMA_ROOT = os.getenv("POLY_GAMMA_ROOT", "https://gamma-api.polymarket.com")
 DATA_API_ROOT = os.getenv("POLY_DATA_API_ROOT", "https://data-api.polymarket.com")
-API_MIN_ORDER_SIZE = 5.0
+# 默认不强制设置最低下单份数，避免与按金额倒推的目标相冲突；如需限制可配置。
+API_MIN_ORDER_SIZE = 0.0
 ORDERBOOK_STALE_AFTER_SEC = 5.0
 POSITION_SYNC_INTERVAL = 60.0
 POST_BUY_POSITION_CHECK_DELAY = 5.0
