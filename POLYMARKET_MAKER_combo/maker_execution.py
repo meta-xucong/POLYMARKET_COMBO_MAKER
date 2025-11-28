@@ -38,7 +38,9 @@ from trading.execution import ClobPolymarketAPI
 
 
 BUY_PRICE_DP = 2
-BUY_SIZE_DP = 4
+# 官方 CLOB 对 size 支持到 6 位小数；按名义金额倒推份数时使用 6 位精度能减少
+# price*size 与目标 quote 之间的偏差，避免因精度不足被拒单。
+BUY_SIZE_DP = 6
 SELL_PRICE_DP = 4
 SELL_SIZE_DP = 2
 _MIN_FILL_EPS = 1e-9
@@ -639,12 +641,18 @@ def maker_buy_follow_bid(
             if use_notional:
                 remaining_quote = max((goal_notional or 0.0) - notional_sum, 0.0)
                 desired_qty = remaining_quote / max(px, 1e-9)
-                eff_qty = max(desired_qty, min_qty)
+                eff_qty = max(desired_qty, min_qty, api_min_qty)
+                # 先按 6 位小数向下取整，使 price*size 不至于显著超过目标 quote。
+                eff_qty = _floor_to_dp(eff_qty, BUY_SIZE_DP)
+                # 如果下取整后不满足最小下单约束，则再补齐到约束值。
+                min_bound = max(min_qty, api_min_qty)
+                if eff_qty + _MIN_FILL_EPS < min_bound:
+                    eff_qty = _ceil_to_dp(min_bound, BUY_SIZE_DP)
             else:
                 eff_qty = max(remaining, min_qty)
-            if api_min_qty:
-                eff_qty = max(eff_qty, api_min_qty)
-            eff_qty = _ceil_to_dp(eff_qty, BUY_SIZE_DP)
+                if api_min_qty:
+                    eff_qty = max(eff_qty, api_min_qty)
+                eff_qty = _ceil_to_dp(eff_qty, BUY_SIZE_DP)
             if eff_qty <= 0:
                 final_status = "SKIPPED"
                 break
@@ -660,6 +668,10 @@ def maker_buy_follow_bid(
             try:
                 response = adapter.create_order(payload)
             except Exception as exc:
+                print(
+                    "[MAKER][BUY] 下单异常，payload=%s decimals=%s use_notional=%s" %
+                    (payload, price_dp_active, use_notional)
+                )
                 min_viable = max(min_qty or 0.0, api_min_qty or 0.0)
                 if _is_insufficient_balance(exc):
                     should_stop = _handle_balance_shortage(
