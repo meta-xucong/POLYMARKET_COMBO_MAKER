@@ -28,7 +28,9 @@ except Exception:  # pragma: no cover - 兼容无 zoneinfo 的环境
 from maker_execution import (
     maker_multi_buy_follow_bid,
     _extract_best_price,
+    _coerce_float,
 )
+from trading.execution import ClobPolymarketAPI
 try:
     from Volatility_arbitrage_main_ws import ws_watch_by_ids
 except Exception:
@@ -1747,6 +1749,82 @@ def main():
                 f"  token_id={mid} | status={status or 'N/A'} | filled={filled if filled is not None else '-'} | remaining={remaining if remaining is not None else '-'}"
             )
 
+    def _wait_until_orders_done(summary: Dict[str, Any]) -> Dict[str, Any]:
+        terminal_states = {
+            "FILLED",
+            "FILLED_TRUNCATED",
+            "SKIPPED",
+            "SKIPPED_TOO_SMALL",
+            "STOPPED",
+            "CANCELLED",
+            "CANCELED",
+            "REJECTED",
+            "EXPIRED",
+        }
+
+        def _is_terminal(status: Optional[str]) -> bool:
+            if status is None:
+                return False
+            return status.upper() in terminal_states
+
+        adapter = None
+        pending_logged = False
+
+        while True:
+            pending: List[Tuple[str, Dict[str, Any]]] = []
+            for mid, payload in summary.items():
+                if mid == "_meta":
+                    continue
+                res = payload.get("result") if isinstance(payload, dict) else None
+                if not isinstance(res, dict):
+                    continue
+                status_val = res.get("status")
+                orders = res.get("orders") if isinstance(res.get("orders"), list) else []
+                if not _is_terminal(status_val) and orders:
+                    pending.append((mid, res))
+
+            if not pending:
+                break
+
+            if adapter is None:
+                adapter = ClobPolymarketAPI(client)
+            if not pending_logged:
+                print("[WAIT] 订单仍在撮合中，继续等待成交…")
+                pending_logged = True
+
+            for mid, res in pending:
+                orders = res.get("orders") or []
+                filled_snapshot = res.get("filled_size") or res.get("filled") or 0.0
+                final_status = res.get("status") or "PENDING"
+                for order in orders:
+                    oid = order.get("id") if isinstance(order, dict) else None
+                    if not oid:
+                        continue
+                    try:
+                        stat = adapter.get_order_status(str(oid))
+                    except Exception as exc:
+                        print(f"[WARN] 查询订单状态失败（{mid} | {oid}）：{exc}")
+                        continue
+                    st_text = str(stat.get("status", "")).upper()
+                    filled_amt = _coerce_float(stat.get("filledAmount")) or 0.0
+                    order["status"] = st_text or order.get("status")
+                    order["filled"] = filled_amt
+                    if st_text in {"FILLED", "MATCHED", "COMPLETED", "EXECUTED"}:
+                        filled_snapshot = max(filled_snapshot, filled_amt)
+                        final_status = "FILLED"
+                    elif st_text in {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}:
+                        if final_status not in {"FILLED", "FILLED_TRUNCATED"}:
+                            final_status = st_text
+
+                res["filled_size"] = filled_snapshot
+                if "filled" not in res or res.get("filled") is None:
+                    res["filled"] = filled_snapshot
+                res["status"] = final_status
+
+            time.sleep(2.0)
+
+        return summary
+
     try:
         summary = maker_multi_buy_follow_bid(
             client,
@@ -1758,6 +1836,7 @@ def main():
             state_callback=_print_state,
             best_bid_fns=best_bid_fns,
         )
+        summary = _wait_until_orders_done(summary)
     except Exception as exc:
         print(f"[ERR] 下单过程中出现异常：{exc}")
         return
