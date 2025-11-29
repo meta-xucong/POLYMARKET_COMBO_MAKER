@@ -305,14 +305,30 @@ def _best_price_info(
     best_fn: Optional[Callable[[], Optional[float]]],
     side: str,
 ) -> Optional[PriceSample]:
+    """Return the best price, filtering out placeholder/invalid values."""
+
+    def _normalize(sample: Optional[PriceSample]) -> Optional[PriceSample]:
+        if sample is None:
+            return None
+        try:
+            price_val = float(sample.price)
+        except (TypeError, ValueError):
+            return None
+
+        # WS 初始占位价常为 0.001，属于明显无效值，需过滤为 None 以防误用。
+        if price_val <= 0.001 + 1e-12:
+            return None
+        return PriceSample(price_val, sample.decimals)
+
     if best_fn is not None:
         try:
             val = best_fn()
         except Exception:
             val = None
         if val is not None and val > 0:
-            return PriceSample(float(val), _infer_price_decimals(val))
-    return _fetch_best_price(client, token_id, side)
+            return _normalize(PriceSample(float(val), _infer_price_decimals(val)))
+
+    return _normalize(_fetch_best_price(client, token_id, side))
 
 
 def _best_bid(
