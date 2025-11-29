@@ -1033,6 +1033,22 @@ def maker_buy_follow_bid(
     }
 
 
+def _parse_market_entry(entry: Any) -> Tuple[Optional[str], Optional[str]]:
+    market_id: Optional[str] = None
+    label: Optional[str] = None
+
+    if isinstance(entry, Mapping):
+        raw_id = entry.get("id") or entry.get("token_id") or entry.get("market_id")
+        market_id = str(raw_id).strip() if raw_id is not None else None
+        name_field = entry.get("name") or entry.get("title") or entry.get("label")
+        label = str(name_field).strip() if name_field is not None else None
+    elif entry is not None:
+        market_id = str(entry).strip()
+        label = market_id
+
+    return market_id, label
+
+
 def maker_multi_buy_follow_bid(
     client: Any,
     submarkets: Iterable[Any],
@@ -1041,6 +1057,9 @@ def maker_multi_buy_follow_bid(
     target_notional: Optional[float] = None,
     state_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     best_bid_fns: Optional[Mapping[str, Callable[[], Optional[float]]]] = None,
+    preload_best_bids: bool = True,
+    price_warmup_timeout: float = 30.0,
+    price_warmup_poll: float = 0.5,
     **kwargs: Any,
 ) -> Dict[str, Dict[str, Any]]:
     """在多个子市场按相同逻辑挂买单。
@@ -1119,19 +1138,7 @@ def maker_multi_buy_follow_bid(
             summary[mid] = {"name": name, "result": new_result}
             _emit_state_locked()
 
-    def _run_market(entry: Any) -> None:
-        market_id: Optional[str] = None
-        label: Optional[str] = None
-
-        if isinstance(entry, Mapping):
-            raw_id = entry.get("id") or entry.get("token_id") or entry.get("market_id")
-            market_id = str(raw_id).strip() if raw_id is not None else None
-            name_field = entry.get("name") or entry.get("title") or entry.get("label")
-            label = str(name_field).strip() if name_field is not None else None
-        elif entry is not None:
-            market_id = str(entry).strip()
-            label = market_id
-
+    def _run_market(entry: Any, market_id: Optional[str], label: Optional[str]) -> None:
         if not market_id:
             print("[MAKER][BUY][WARN] 跳过缺少 market/token id 的子市场条目：", entry)
             return
@@ -1171,9 +1178,61 @@ def maker_multi_buy_follow_bid(
                 },
             )
 
+    entries = [(entry, *_parse_market_entry(entry)) for entry in submarkets]
+
+    warmup_failed = False
+    failed_ids: List[str] = []
+    if preload_best_bids:
+        pending: Dict[str, Optional[Callable[[], Optional[float]]]] = {}
+        for entry, mid, _ in entries:
+            if not mid:
+                continue
+            best_fn = None
+            if best_bid_fns is not None:
+                best_fn = best_bid_fns.get(mid) if isinstance(best_bid_fns, Mapping) else None
+            if best_fn is None:
+                best_fn = kwargs.get("best_bid_fn")
+            pending[mid] = best_fn
+
+        if pending:
+            start = time.time()
+            poll_interval = max(price_warmup_poll, 1e-6)
+            timeout = float(price_warmup_timeout)
+            while pending:
+                for mid, fn in list(pending.items()):
+                    info = _best_price_info(client, mid, fn, "bid")
+                    if info is not None and info.price > 0:
+                        shared_active_prices[mid] = float(info.price)
+                        pending.pop(mid, None)
+                if not pending:
+                    break
+                if timeout > 0 and time.time() - start >= timeout:
+                    failed_ids = sorted(pending.keys())
+                    warmup_failed = True
+                    print(
+                        "[MAKER][BUY] 价格预热超时，跳过下单：", ", ".join(failed_ids)
+                    )
+                    break
+                time.sleep(poll_interval)
+
+    if warmup_failed:
+        for _, mid, label in entries:
+            if mid in failed_ids:
+                _update_summary(mid, {"name": label or mid, "result": {"status": "NO_PRICE"}})
+        states: List[str] = []
+        for mid, payload in summary.items():
+            if mid is None:
+                continue
+            res = payload.get("result") if isinstance(payload, Mapping) else None
+            if isinstance(res, Mapping) and "status" in res:
+                states.append(str(res.get("status")))
+        states.append("PRICE_WARMUP_TIMEOUT")
+        summary["_meta"] = {"states": states, "balance_ok": True}
+        return summary
+
     threads: List[threading.Thread] = []
-    for entry in submarkets:
-        t = threading.Thread(target=_run_market, args=(entry,), daemon=True)
+    for entry, mid, label in entries:
+        t = threading.Thread(target=_run_market, args=(entry, mid, label), daemon=True)
         threads.append(t)
         t.start()
 
