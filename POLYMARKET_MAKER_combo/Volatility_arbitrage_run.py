@@ -1755,25 +1755,40 @@ def main():
             return 0.0
         return float(quant)
 
-    price_samples: Dict[str, float] = {}
-    for entry in chosen_tokens:
-        token_id = (
-            entry.get("id")
-            or entry.get("token_id")
-            or entry.get("market_id")
-            or entry.get("asset_id")
+    def _collect_price_samples(
+        token_ids: List[str], retries: int = 6, interval: float = 0.5
+    ) -> Tuple[Dict[str, float], set[str]]:
+        samples: Dict[str, float] = {}
+        pending: set[str] = {tid for tid in token_ids if tid}
+
+        for attempt in range(retries):
+            for tid in list(pending):
+                best_fn = None
+                if isinstance(best_bid_fns, Mapping):
+                    best_fn = best_bid_fns.get(tid)
+                info = _best_bid_info(client, tid, best_fn)
+                if info is None or info.price is None or info.price <= 0:
+                    continue
+                samples[tid] = float(info.price)
+                pending.discard(tid)
+
+            if not pending:
+                break
+
+            if attempt == 0:
+                print("[INFO] 正在等待实时买一价刷新，稍后重试…")
+            time.sleep(interval)
+
+        return samples, pending
+
+    price_samples, missing_tokens = _collect_price_samples(token_id_list)
+
+    if missing_tokens:
+        print(
+            "[ERR] 未能获取以下 token 的实时买一价，退出：",
+            ", ".join(sorted(missing_tokens)),
         )
-        tid = str(token_id).strip() if token_id is not None else ""
-        if not tid:
-            continue
-        best_fn = None
-        if isinstance(best_bid_fns, Mapping):
-            best_fn = best_bid_fns.get(tid)
-        info = _best_bid_info(client, tid, best_fn)
-        if info is None or info.price is None or info.price <= 0:
-            print(f"[ERR] 无法获取 token_id={tid} 的买一价，退出。")
-            return
-        price_samples[tid] = float(info.price)
+        return
 
     if not price_samples:
         print("[ERR] 无法为所选子市场获取买一价，退出。")
