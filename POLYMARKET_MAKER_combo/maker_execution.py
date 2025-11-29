@@ -102,6 +102,89 @@ class PriceSumArbitrageGuard:
             return True
 
 
+class UnifiedQtyController:
+    """Recalculate uniform order size when best bids change.
+
+    通过跟踪所有子市场的最新买一价并结合总预算，动态倒推出统一的下单份数。
+    当份数发生显著变化时会递增版本号，供下游撮合线程感知并调整挂单。
+    """
+
+    def __init__(
+        self,
+        total_budget: float,
+        initial_prices: Mapping[str, float],
+        *,
+        min_qty_delta: float = 0.01,
+        min_price_delta: float = 1e-6,
+    ) -> None:
+        self.total_budget = float(total_budget)
+        self._lock = threading.Lock()
+        self._version = 0
+        self._last_change: Optional[Dict[str, float]] = None
+        self._event = threading.Event()
+        self.prices: Dict[str, float] = {str(k): float(v) for k, v in initial_prices.items() if float(v) > 0}
+        self.target_size: float = _floor_to_dp(self._compute_size(), BUY_SIZE_DP)
+        self.min_qty_delta = max(float(min_qty_delta), 0.0)
+        self.min_price_delta = max(float(min_price_delta), 0.0)
+
+    def _compute_size(self) -> float:
+        total_price = sum(self.prices.values())
+        if total_price <= 0:
+            return 0.0
+        return self.total_budget / total_price
+
+    def update_price(self, token_id: str, new_price: float, *, source: str = "ws") -> None:
+        token_id = str(token_id).strip()
+        if not token_id:
+            return
+        try:
+            price_val = float(new_price)
+        except (TypeError, ValueError):
+            return
+        if price_val <= 0:
+            return
+        with self._lock:
+            old_price = self.prices.get(token_id)
+            if old_price is not None and abs(old_price - price_val) < self.min_price_delta:
+                return
+            self.prices[token_id] = price_val
+            new_qty = _floor_to_dp(self._compute_size(), BUY_SIZE_DP)
+            if abs(new_qty - self.target_size) < self.min_qty_delta:
+                return
+            old_qty = self.target_size
+            self.target_size = new_qty
+            self._version += 1
+            self._last_change = {
+                "old_price": float(old_price) if old_price is not None else 0.0,
+                "new_price": price_val,
+                "old_qty": old_qty,
+                "new_qty": new_qty,
+                "version": self._version,
+                "token_id": token_id,
+                "source": source,
+            }
+            self._event.set()
+
+    def current_version(self) -> int:
+        with self._lock:
+            return self._version
+
+    def consume_update(self, last_seen: int) -> Optional[Dict[str, float]]:
+        with self._lock:
+            if self._version == last_seen or self._last_change is None:
+                return None
+            change = dict(self._last_change)
+            self._event.clear()
+            return change
+
+    def wait_for_update(self, last_seen: int, timeout: Optional[float] = None) -> Optional[Dict[str, float]]:
+        if self._version != last_seen:
+            return self.consume_update(last_seen)
+        if not self._event.wait(timeout=timeout):
+            return None
+        return self.consume_update(last_seen)
+
+
 def _round_up_to_dp(value: float, dp: int) -> float:
     factor = 10 ** dp
     return math.ceil(value * factor - 1e-12) / factor
@@ -458,6 +541,7 @@ def maker_buy_follow_bid(
     shared_active_prices: Optional[Dict[str, float]] = None,
     price_update_guard: Optional[Callable[[Mapping[str, float]], bool]] = None,
     price_sum_guard: Optional[PriceSumArbitrageGuard] = None,
+    qty_controller: Optional[UnifiedQtyController] = None,
 ) -> Dict[str, Any]:
     """Continuously maintain a maker buy order following the market bid.
 
@@ -514,6 +598,7 @@ def maker_buy_follow_bid(
     no_fill_poll_count = 0
 
     next_probe_at = 0.0
+    controller_version = qty_controller.current_version() if qty_controller else 0
 
     def _remaining_qty_est(price_hint: Optional[float]) -> float:
         if not use_notional:
@@ -679,6 +764,70 @@ def maker_buy_follow_bid(
             return False
         return True
 
+    def _maybe_apply_unified_qty(price_hint: Optional[float]) -> bool:
+        """Apply latest unified qty when WS-driven prices shift.
+
+        Returns True when the caller should restart the polling cycle (e.g.,
+        after cancelling an outdated挂单).
+        """
+
+        nonlocal goal_size, remaining, controller_version, active_order, active_price
+
+        if qty_controller is None or use_notional:
+            return False
+
+        update = qty_controller.consume_update(controller_version)
+        if update is None:
+            return False
+
+        try:
+            controller_version = int(update.get("version", controller_version))
+        except Exception:
+            controller_version += 1
+
+        new_qty = _ceil_to_dp(float(update.get("new_qty", goal_size)), size_dp_active)
+        old_qty = goal_size
+        goal_size = max(new_qty, filled_total)
+        remaining = _remaining_qty_est(price_hint)
+        old_px = _coerce_float(update.get("old_price")) or 0.0
+        new_px = _coerce_float(update.get("new_price")) or 0.0
+        reason = update.get("source") or "price-change"
+        print(
+            "[MAKER][BUY] 统一份数重算(%s) -> old_px=%.{dp}f new_px=%.{dp}f old_qty=%.{sq}f new_qty=%.{sq}f".format(
+                dp=price_dp_active, sq=size_dp_active
+            )
+            % (reason, old_px, new_px, old_qty, goal_size)
+        )
+
+        desired_slice = max(goal_size - filled_total, 0.0)
+        current_slice = desired_slice
+        rec = records.get(active_order) if active_order else None
+        if rec is not None:
+            try:
+                current_slice = float(rec.get("size", desired_slice) or desired_slice)
+            except Exception:
+                current_slice = desired_slice
+
+        delta = abs(current_slice - desired_slice)
+        threshold = qty_controller.min_qty_delta if qty_controller is not None else _MIN_FILL_EPS
+        if delta >= max(threshold, _MIN_FILL_EPS) and active_order:
+            print(
+                f"[MAKER][BUY] 挂单数量需调整，撤单重挂 | old_qty={current_slice:.{size_dp_active}f} new_qty={desired_slice:.{size_dp_active}f}"
+            )
+            _cancel_order(client, active_order)
+            rec = records.get(active_order)
+            if rec is not None:
+                rec["status"] = "CANCELLED"
+            active_order = None
+            active_price = None
+            if shared_active_prices is not None:
+                shared_active_prices[token_id] = float(new_px or 0.0)
+            if price_sum_guard is not None and new_px:
+                price_sum_guard.commit_price(token_id, float(new_px))
+            return True
+
+        return False
+
     while True:
         if state_callback and next_probe_at <= 0:
             _emit_state("PENDING")
@@ -691,6 +840,9 @@ def maker_buy_follow_bid(
                     rec["status"] = "CANCELLED"
             final_status = "STOPPED"
             break
+
+        if _maybe_apply_unified_qty(active_price):
+            continue
 
         if active_order is None:
             if api_min_qty and not use_notional and remaining + _MIN_FILL_EPS < api_min_qty:
@@ -1076,6 +1228,7 @@ def maker_multi_buy_follow_bid(
     preload_best_bids: bool = True,
     price_warmup_timeout: float = 30.0,
     price_warmup_poll: float = 0.5,
+    qty_controller: Optional[UnifiedQtyController] = None,
     **kwargs: Any,
 ) -> Dict[str, Dict[str, Any]]:
     """在多个子市场按相同逻辑挂买单。
@@ -1172,6 +1325,8 @@ def maker_multi_buy_follow_bid(
             per_market_kwargs["price_update_guard"] = _wrap_price_guard(user_guard)
             per_market_kwargs["shared_active_prices"] = shared_active_prices
             per_market_kwargs["price_sum_guard"] = price_guard
+            if qty_controller is not None:
+                per_market_kwargs["qty_controller"] = qty_controller
             if best_bid_fns is not None:
                 best_fn = best_bid_fns.get(market_id) if isinstance(best_bid_fns, Mapping) else None
                 if best_fn is not None:
