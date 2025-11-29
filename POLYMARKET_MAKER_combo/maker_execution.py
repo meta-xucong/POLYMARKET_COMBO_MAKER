@@ -1144,8 +1144,6 @@ def maker_multi_buy_follow_bid(
 
     entries = [(entry, *_parse_market_entry(entry)) for entry in submarkets]
 
-    warmup_failed = False
-    failed_ids: List[str] = []
     if preload_best_bids:
         pending: Dict[str, Optional[Callable[[], Optional[float]]]] = {}
         for entry, mid, _ in entries:
@@ -1161,7 +1159,9 @@ def maker_multi_buy_follow_bid(
         if pending:
             start = time.time()
             poll_interval = max(price_warmup_poll, 1e-6)
-            timeout = float(price_warmup_timeout)
+            heartbeat_interval = 10.0
+            last_heartbeat = start
+            pending_ids = set(pending.keys())
             while pending:
                 for mid, fn in list(pending.items()):
                     info = _best_price_info(client, mid, fn, "bid")
@@ -1170,29 +1170,17 @@ def maker_multi_buy_follow_bid(
                         pending.pop(mid, None)
                 if not pending:
                     break
-                if timeout > 0 and time.time() - start >= timeout:
-                    failed_ids = sorted(pending.keys())
-                    warmup_failed = True
+                now = time.time()
+                if now - last_heartbeat >= heartbeat_interval:
+                    obtained = sorted(set(shared_active_prices.keys()) & pending_ids)
+                    waiting = sorted(pending.keys())
                     print(
-                        "[MAKER][BUY] 价格预热超时，跳过下单：", ", ".join(failed_ids)
+                        "[HEARTBEAT][MAKER][BUY] 报价预热中：已获取 {}/{}；待获取: {}".format(
+                            len(obtained), len(pending_ids), ", ".join(waiting) or "无"
+                        )
                     )
-                    break
+                    last_heartbeat = now
                 time.sleep(poll_interval)
-
-    if warmup_failed:
-        for _, mid, label in entries:
-            if mid in failed_ids:
-                _update_summary(mid, {"name": label or mid, "result": {"status": "NO_PRICE"}})
-        states: List[str] = []
-        for mid, payload in summary.items():
-            if mid is None:
-                continue
-            res = payload.get("result") if isinstance(payload, Mapping) else None
-            if isinstance(res, Mapping) and "status" in res:
-                states.append(str(res.get("status")))
-        states.append("PRICE_WARMUP_TIMEOUT")
-        summary["_meta"] = {"states": states, "balance_ok": True}
-        return summary
 
     threads: List[threading.Thread] = []
     for entry, mid, label in entries:
