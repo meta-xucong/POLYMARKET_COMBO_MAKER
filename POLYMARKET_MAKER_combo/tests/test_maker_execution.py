@@ -1,4 +1,5 @@
 import collections
+import time
 from typing import Deque, Dict, List
 
 import pytest
@@ -453,10 +454,42 @@ def test_multi_buy_runs_for_each_submarket(monkeypatch):
     monkeypatch.setattr(maker, "maker_buy_follow_bid", _fake_buy)
 
     submarkets = ["aaa", {"market_id": "bbb", "name": "B label"}]
-    results = maker.maker_multi_buy_follow_bid(object(), submarkets, target_notional=12.5)
+    results = maker.maker_multi_buy_follow_bid(
+        object(),
+        submarkets,
+        target_notional=12.5,
+        preload_best_bids=False,
+    )
 
     assert calls == ["aaa", "bbb"]
     assert set(results.keys()) == {"aaa", "bbb", "_meta"}
     assert results["bbb"]["name"] == "B label"
     assert results.get("_meta", {}).get("balance_ok") is True
     assert "FILLED" in (results.get("_meta", {}).get("states") or [])
+
+
+def test_multi_buy_waits_for_price_warmup(monkeypatch):
+    calls: List[str] = []
+
+    def _fake_buy(*args, **kwargs):
+        calls.append("called")
+        return {"status": "FILLED"}
+
+    monkeypatch.setattr(maker, "maker_buy_follow_bid", _fake_buy)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    best_bid_fns = {"aaa": lambda: None, "bbb": lambda: None}
+
+    results = maker.maker_multi_buy_follow_bid(
+        object(),
+        ["aaa", "bbb"],
+        target_notional=5.0,
+        best_bid_fns=best_bid_fns,
+        price_warmup_timeout=0.001,
+        price_warmup_poll=0.0,
+    )
+
+    assert calls == []
+    assert results.get("_meta", {}).get("balance_ok") is True
+    assert "NO_PRICE" in (results.get("_meta", {}).get("states") or [])
+    assert "PRICE_WARMUP_TIMEOUT" in (results.get("_meta", {}).get("states") or [])
