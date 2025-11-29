@@ -32,6 +32,7 @@ from maker_execution import (
     _best_bid_info,
     _coerce_float,
     _extract_best_price,
+    UnifiedQtyController,
     maker_multi_buy_follow_bid,
 )
 from trading.execution import ClobPolymarketAPI
@@ -1415,7 +1416,9 @@ def _prompt_token_selection(candidates: List[Dict[str, str]]) -> List[Dict[str, 
 class _WsBestBidTracker:
     """轻量级 WS 订阅器，用于追踪子问题的实时买一价。"""
 
-    def __init__(self, token_ids: List[str]):
+    def __init__(
+        self, token_ids: List[str], *, on_bid_change: Optional[Callable[[str, float, Optional[float]], None]] = None
+    ):
         self.token_ids = [str(tid).strip() for tid in token_ids if tid]
         self._best: Dict[str, float] = {}
         self._lock = threading.Lock()
@@ -1426,6 +1429,10 @@ class _WsBestBidTracker:
         }
         self._thread: Optional[threading.Thread] = None
         self._error: Optional[Exception] = None
+        self._on_bid_change = on_bid_change
+
+    def set_on_bid_change(self, handler: Optional[Callable[[str, float, Optional[float]], None]]) -> None:
+        self._on_bid_change = handler
 
     def _has_all_prices_unlocked(self) -> bool:
         if self._first_bid_events:
@@ -1472,6 +1479,7 @@ class _WsBestBidTracker:
                 sample = _extract_best_price(pc, "bid")
                 if sample is None:
                     continue
+                prev = self._best.get(token_id)
                 with self._lock:
                     self._best[token_id] = float(sample.price)
                     evt = self._first_bid_events.get(token_id)
@@ -1479,6 +1487,11 @@ class _WsBestBidTracker:
                         evt.set()
                     if self._has_all_prices_unlocked():
                         self._ready.set()
+                if self._on_bid_change and (prev is None or abs(prev - float(sample.price)) > 1e-12):
+                    try:
+                        self._on_bid_change(token_id, float(sample.price), prev)
+                    except Exception:
+                        pass
             return
 
         # 兜底：尝试直接从事件顶层提取。
@@ -1488,6 +1501,7 @@ class _WsBestBidTracker:
         sample = _extract_best_price(event, "bid")
         if sample is None:
             return
+        prev = self._best.get(token_id)
         with self._lock:
             self._best[token_id] = float(sample.price)
             evt = self._first_bid_events.get(token_id)
@@ -1495,6 +1509,11 @@ class _WsBestBidTracker:
                 evt.set()
             if self._has_all_prices_unlocked():
                 self._ready.set()
+        if self._on_bid_change and (prev is None or abs(prev - float(sample.price)) > 1e-12):
+            try:
+                self._on_bid_change(token_id, float(sample.price), prev)
+            except Exception:
+                pass
 
     def start(self) -> bool:
         if ws_watch_by_ids is None:
@@ -1897,6 +1916,16 @@ def main():
 
     est_quote = target_size * total_price
 
+    qty_controller = UnifiedQtyController(
+        total_budget,
+        price_samples,
+        min_qty_delta=0.01,
+    )
+    qty_controller.target_size = target_size
+
+    if tracker is not None:
+        tracker.set_on_bid_change(lambda tid, new, old: qty_controller.update_price(tid, new, source="ws"))
+
     print(
         f"[PLAN] Σ(买一价)={total_price:.4f}，统一份数 qty=floor({total_budget} / Σprice)={target_size}，总计约 {est_quote:.4f} USDC。"
     )
@@ -2012,6 +2041,7 @@ def main():
             progress_probe_interval=10.0,
             state_callback=_print_state,
             best_bid_fns=best_bid_fns,
+            qty_controller=qty_controller,
         )
         summary = _wait_until_orders_done(summary)
     except Exception as exc:
