@@ -32,7 +32,6 @@ from maker_execution import (
     _best_bid_info,
     _coerce_float,
     _extract_best_price,
-    UnifiedQtyController,
     maker_multi_buy_follow_bid,
 )
 from trading.execution import ClobPolymarketAPI
@@ -1825,20 +1824,18 @@ def main():
     else:
         print("[WARN] WS 行情模块不可用，继续尝试 REST 报价。")
 
-    print("请输入本次下单投入的总USDC金额（留空则默认按 5 USDC 执行）：")
+    print("请输入本次每个子问题的下单份数（留空则默认按 5 份执行）：")
     size_raw = input().strip()
-    total_budget: float = 5.0
+    target_size: float = 5.0
     if size_raw:
         try:
-            total_budget = float(size_raw)
+            target_size = float(size_raw)
         except Exception:
-            print("[ERR] 金额输入非法，退出。")
+            print("[ERR] 份数输入非法，退出。")
             return
-        if total_budget <= 0:
-            print("[ERR] 金额必须大于 0。")
+        if target_size <= 0:
+            print("[ERR] 份数必须大于 0。")
             return
-
-    print(f"[RUN] 本次总投入 {total_budget} USDC，开始估算每个子问题的下单份数…")
 
     def _floor_to_size_dp(value: float) -> float:
         try:
@@ -1847,90 +1844,15 @@ def main():
             return 0.0
         return float(quant)
 
-    def _collect_price_samples(
-        token_ids: List[str], retries: int = 6, interval: float = 0.5, min_rounds: int = 2
-    ) -> Tuple[Dict[str, float], set[str]]:
-        """采样实时买一价，至少跑 ``min_rounds`` 轮以防首次取到占位价。"""
-
-        samples: Dict[str, float] = {}
-        seen: set[str] = set()
-        need_attempts = max(int(min_rounds), 1)
-
-        for attempt in range(max(retries, need_attempts)):
-            for tid in token_ids:
-                if not tid:
-                    continue
-                best_fn = None
-                if isinstance(best_bid_fns, Mapping):
-                    best_fn = best_bid_fns.get(tid)
-                info = _best_bid_info(client, tid, best_fn)
-                if info is None or info.price is None or info.price <= 0:
-                    continue
-                samples[tid] = float(info.price)
-                seen.add(tid)
-
-            all_ready = len(seen) == len([tid for tid in token_ids if tid])
-            if all_ready and attempt + 1 >= need_attempts:
-                break
-
-            if attempt == 0:
-                print("[INFO] 正在等待实时买一价刷新，稍后重试…")
-            time.sleep(interval)
-
-        missing = {tid for tid in token_ids if tid and tid not in seen}
-        return samples, missing
-
-    price_samples, missing_tokens = _collect_price_samples(token_id_list)
-
-    if missing_tokens:
-        print(
-            "[ERR] 未能获取以下 token 的实时买一价，退出：",
-            ", ".join(sorted(missing_tokens)),
-        )
-        return
-
-    if not price_samples:
-        print("[ERR] 无法为所选子市场获取买一价，退出。")
-        return
-
-    total_price = sum(price_samples.values())
-    if total_price <= 0:
-        print("[ERR] 价格求和异常，退出。")
-        return
-
-    max_affordable_size = total_budget / total_price
-    target_size = _floor_to_size_dp(max_affordable_size)
-    if target_size <= 0:
-        print(
-            f"[ERR] 总金额 {total_budget} USDC 无法按当前买一价买入至少 1 份（约需 {total_price:.4f} USDC），退出。"
-        )
-        return
+    target_size = _floor_to_size_dp(target_size)
 
     if target_size < API_MIN_ORDER_SIZE:
-        required = API_MIN_ORDER_SIZE * total_price
         print(
-            f"[ERR] 总金额不足以满足每个子市场至少 {API_MIN_ORDER_SIZE} 份的合规要求，"
-            f"当前至少需要约 {required:.2f} USDC，退出。"
+            f"[ERR] 份数必须不低于合规要求的 {API_MIN_ORDER_SIZE}，当前输入 {target_size}，退出。"
         )
         return
 
-    est_quote = target_size * total_price
-
-    qty_controller = UnifiedQtyController(
-        total_budget,
-        price_samples,
-        min_qty_delta=0.01,
-    )
-    qty_controller.target_size = target_size
-
-    if tracker is not None:
-        tracker.set_on_bid_change(lambda tid, new, old: qty_controller.update_price(tid, new, source="ws"))
-
-    print(
-        f"[PLAN] Σ(买一价)={total_price:.4f}，统一份数 qty=floor({total_budget} / Σprice)={target_size}，总计约 {est_quote:.4f} USDC。"
-    )
-    print(f"[RUN] 即将按统一份数 {target_size} 仅买入 {len(chosen_tokens)} 个子问题…")
-
+    print(f"[RUN] 本次将为每个子问题挂买单 {target_size} 份，共计 {len(chosen_tokens)} 个子问题。")
     latest_state: Dict[str, Dict[str, Any]] = {}
     last_state_log = 0.0
 
@@ -2041,7 +1963,6 @@ def main():
             progress_probe_interval=10.0,
             state_callback=_print_state,
             best_bid_fns=best_bid_fns,
-            qty_controller=qty_controller,
         )
         summary = _wait_until_orders_done(summary)
     except Exception as exc:
