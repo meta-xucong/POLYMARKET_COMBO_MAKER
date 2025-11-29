@@ -1415,7 +1415,9 @@ def _prompt_token_selection(candidates: List[Dict[str, str]]) -> List[Dict[str, 
 class _WsBestBidTracker:
     """轻量级 WS 订阅器，用于追踪子问题的实时买一价。"""
 
-    def __init__(self, token_ids: List[str]):
+    def __init__(
+        self, token_ids: List[str], *, on_bid_change: Optional[Callable[[str, float, Optional[float]], None]] = None
+    ):
         self.token_ids = [str(tid).strip() for tid in token_ids if tid]
         self._best: Dict[str, float] = {}
         self._lock = threading.Lock()
@@ -1426,6 +1428,10 @@ class _WsBestBidTracker:
         }
         self._thread: Optional[threading.Thread] = None
         self._error: Optional[Exception] = None
+        self._on_bid_change = on_bid_change
+
+    def set_on_bid_change(self, handler: Optional[Callable[[str, float, Optional[float]], None]]) -> None:
+        self._on_bid_change = handler
 
     def _has_all_prices_unlocked(self) -> bool:
         if self._first_bid_events:
@@ -1482,6 +1488,11 @@ class _WsBestBidTracker:
                         evt.set()
                     if self._has_all_prices_unlocked():
                         self._ready.set()
+                if self._on_bid_change and (prev is None or abs(prev - float(sample.price)) > 1e-12):
+                    try:
+                        self._on_bid_change(token_id, float(sample.price), prev)
+                    except Exception:
+                        pass
             return
 
         # 兜底：尝试直接从事件顶层提取。
@@ -1491,6 +1502,7 @@ class _WsBestBidTracker:
         sample = _extract_best_price(event, "bid")
         if sample is None:
             return
+        prev = self._best.get(token_id)
         with self._lock:
             price_val = float(sample.price)
             if price_val <= 0.01:
@@ -1501,6 +1513,11 @@ class _WsBestBidTracker:
                 evt.set()
             if self._has_all_prices_unlocked():
                 self._ready.set()
+        if self._on_bid_change and (prev is None or abs(prev - float(sample.price)) > 1e-12):
+            try:
+                self._on_bid_change(token_id, float(sample.price), prev)
+            except Exception:
+                pass
 
     def start(self) -> bool:
         if ws_watch_by_ids is None:
@@ -1812,20 +1829,18 @@ def main():
     else:
         print("[WARN] WS 行情模块不可用，继续尝试 REST 报价。")
 
-    print("请输入本次下单投入的总USDC金额（留空则默认按 5 USDC 执行）：")
+    print("请输入本次每个子问题的下单份数（留空则默认按 5 份执行）：")
     size_raw = input().strip()
-    total_budget: float = 5.0
+    target_size: float = 5.0
     if size_raw:
         try:
-            total_budget = float(size_raw)
+            target_size = float(size_raw)
         except Exception:
-            print("[ERR] 金额输入非法，退出。")
+            print("[ERR] 份数输入非法，退出。")
             return
-        if total_budget <= 0:
-            print("[ERR] 金额必须大于 0。")
+        if target_size <= 0:
+            print("[ERR] 份数必须大于 0。")
             return
-
-    print(f"[RUN] 本次总投入 {total_budget} USDC，开始估算每个子问题的下单份数…")
 
     def _floor_to_size_dp(value: float) -> float:
         try:
@@ -1864,44 +1879,13 @@ def main():
                 print("[INFO] 正在等待实时买一价刷新，稍后重试…")
             time.sleep(interval)
 
-        missing = {tid for tid in token_ids if tid and tid not in seen}
-        return samples, missing
-
-    price_samples, missing_tokens = _collect_price_samples(token_id_list)
-
-    if missing_tokens:
+    if target_size < API_MIN_ORDER_SIZE:
         print(
-            "[ERR] 未能获取以下 token 的实时买一价，退出：",
-            ", ".join(sorted(missing_tokens)),
+            f"[ERR] 份数必须不低于合规要求的 {API_MIN_ORDER_SIZE}，当前输入 {target_size}，退出。"
         )
         return
 
-    if not price_samples:
-        print("[ERR] 无法为所选子市场获取买一价，退出。")
-        return
-
-    total_price = sum(price_samples.values())
-    if total_price <= 0:
-        print("[ERR] 价格求和异常，退出。")
-        return
-
-    max_affordable_size = total_budget / total_price
-    if max_affordable_size < API_MIN_ORDER_SIZE:
-        required = API_MIN_ORDER_SIZE * total_price
-        print(
-            f"[ERR] 总金额不足以满足每个子市场至少 {API_MIN_ORDER_SIZE} 份的合规要求，"
-            f"当前至少需要约 {required:.2f} USDC，退出。"
-        )
-        return
-
-    target_size = max(_floor_to_size_dp(max_affordable_size), API_MIN_ORDER_SIZE)
-    est_quote = target_size * total_price
-
-    print(
-        f"[PLAN] 当前买一价估算：每个子问题下单 {target_size} 份，总计约 {est_quote:.4f} USDC。"
-    )
-    print(f"[RUN] 即将按统一份数 {target_size} 仅买入 {len(chosen_tokens)} 个子问题…")
-
+    print(f"[RUN] 本次将为每个子问题挂买单 {target_size} 份，共计 {len(chosen_tokens)} 个子问题。")
     latest_state: Dict[str, Dict[str, Any]] = {}
     last_state_log = 0.0
 
