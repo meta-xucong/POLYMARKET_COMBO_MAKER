@@ -467,9 +467,6 @@ def maker_buy_follow_bid(
 
     goal_size = max(_ceil_to_dp(float(target_size or 0.0), BUY_SIZE_DP), 0.0)
     api_min_qty = 0.0
-    if min_order_size and min_order_size > 0:
-        api_min_qty = _ceil_to_dp(float(min_order_size), BUY_SIZE_DP)
-        goal_size = max(goal_size, api_min_qty)
     if goal_size <= 0:
         return {
             "status": "SKIPPED",
@@ -672,9 +669,6 @@ def maker_buy_follow_bid(
             break
 
         if active_order is None:
-            if api_min_qty and remaining + _MIN_FILL_EPS < api_min_qty:
-                final_status = "FILLED_TRUNCATED" if filled_total > _MIN_FILL_EPS else "SKIPPED_TOO_SMALL"
-                break
             bid_info = _best_bid_info(client, token_id, best_bid_fn)
             if bid_info is None:
                 missing_orderbook_count += 1
@@ -705,13 +699,7 @@ def maker_buy_follow_bid(
             if px <= 0:
                 sleep_fn(poll_sec)
                 continue
-            min_qty = 0.0
-            if min_quote_amt and min_quote_amt > 0:
-                min_qty = _ceil_to_dp(min_quote_amt / max(px, 1e-9), size_dp_active)
-            eff_qty = max(remaining, min_qty)
-            if api_min_qty:
-                eff_qty = max(eff_qty, api_min_qty)
-            eff_qty = _ceil_to_dp(eff_qty, size_dp_active)
+            eff_qty = _ceil_to_dp(remaining, size_dp_active)
             if eff_qty <= 0:
                 final_status = "SKIPPED"
                 break
@@ -736,7 +724,7 @@ def maker_buy_follow_bid(
                     "[MAKER][BUY] 下单异常，payload=%s decimals=%s exc=%r"
                     % (payload, price_dp_active, exc)
                 )
-                min_viable = max(min_qty or 0.0, api_min_qty or 0.0)
+                min_viable = max(_ceil_to_dp(remaining, size_dp_active), 0.0)
                 precision_hint = str(getattr(exc, "args", [None])[0]).lower()
                 precision_error = "precision" in precision_hint or "decimal" in precision_hint
                 if precision_error and price_dp_active < BUY_SIZE_DP:
@@ -917,20 +905,14 @@ def maker_buy_follow_bid(
         current_bid = current_bid_info.price if current_bid_info is not None else None
         if current_bid_info is not None:
             _maybe_update_price_dp(current_bid_info.decimals)
-        min_buyable = 0.0
-        if min_quote_amt and min_quote_amt > 0 and current_bid and current_bid > 0:
-            min_buyable = _ceil_to_dp(min_quote_amt / max(current_bid, 1e-9), size_dp_active)
-        if api_min_qty:
-            min_buyable = max(min_buyable, api_min_qty)
-
-        if remaining <= _MIN_FILL_EPS or (min_buyable and remaining < min_buyable):
+        if remaining <= _MIN_FILL_EPS:
             if active_order:
                 _cancel_order(client, active_order)
                 rec = records.get(active_order)
                 if rec is not None:
                     rec["status"] = "CANCELLED"
                 active_order = None
-            final_status = "FILLED" if remaining <= _MIN_FILL_EPS else "FILLED_TRUNCATED" if filled_total > _MIN_FILL_EPS else "SKIPPED_TOO_SMALL"
+            final_status = "FILLED"
             break
 
         if current_bid is not None and active_price is not None and current_bid >= active_price + tick - 1e-12:
@@ -970,7 +952,7 @@ def maker_buy_follow_bid(
             reason = "[MAKER][BUY] 订单被撮合层标记为 INVALID，尝试调整买入目标后重试。"
             if status_shortage and status_text_upper not in invalid_states:
                 reason = "[MAKER][BUY] 订单状态提示余额不足，尝试调整买入目标后重试。"
-            min_viable = max(min_buyable or 0.0, api_min_qty or 0.0)
+            min_viable = _ceil_to_dp(remaining, size_dp_active)
             should_stop = _handle_balance_shortage(reason, min_viable, fatal=status_shortage)
             if should_stop:
                 break
