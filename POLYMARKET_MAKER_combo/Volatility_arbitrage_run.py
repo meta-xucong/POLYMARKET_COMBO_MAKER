@@ -1880,7 +1880,14 @@ def main():
         return
 
     max_affordable_size = total_budget / total_price
-    if max_affordable_size < API_MIN_ORDER_SIZE:
+    target_size = _floor_to_size_dp(max_affordable_size)
+    if target_size <= 0:
+        print(
+            f"[ERR] 总金额 {total_budget} USDC 无法按当前买一价买入至少 1 份（约需 {total_price:.4f} USDC），退出。"
+        )
+        return
+
+    if target_size < API_MIN_ORDER_SIZE:
         required = API_MIN_ORDER_SIZE * total_price
         print(
             f"[ERR] 总金额不足以满足每个子市场至少 {API_MIN_ORDER_SIZE} 份的合规要求，"
@@ -1888,11 +1895,10 @@ def main():
         )
         return
 
-    target_size = max(_floor_to_size_dp(max_affordable_size), API_MIN_ORDER_SIZE)
     est_quote = target_size * total_price
 
     print(
-        f"[PLAN] 当前买一价估算：每个子问题下单 {target_size} 份，总计约 {est_quote:.4f} USDC。"
+        f"[PLAN] Σ(买一价)={total_price:.4f}，统一份数 qty=floor({total_budget} / Σprice)={target_size}，总计约 {est_quote:.4f} USDC。"
     )
     print(f"[RUN] 即将按统一份数 {target_size} 仅买入 {len(chosen_tokens)} 个子问题…")
 
