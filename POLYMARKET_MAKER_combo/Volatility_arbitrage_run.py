@@ -1756,13 +1756,18 @@ def main():
         return float(quant)
 
     def _collect_price_samples(
-        token_ids: List[str], retries: int = 6, interval: float = 0.5
+        token_ids: List[str], retries: int = 6, interval: float = 0.5, min_rounds: int = 2
     ) -> Tuple[Dict[str, float], set[str]]:
-        samples: Dict[str, float] = {}
-        pending: set[str] = {tid for tid in token_ids if tid}
+        """采样实时买一价，至少跑 ``min_rounds`` 轮以防首次取到占位价。"""
 
-        for attempt in range(retries):
-            for tid in list(pending):
+        samples: Dict[str, float] = {}
+        seen: set[str] = set()
+        need_attempts = max(int(min_rounds), 1)
+
+        for attempt in range(max(retries, need_attempts)):
+            for tid in token_ids:
+                if not tid:
+                    continue
                 best_fn = None
                 if isinstance(best_bid_fns, Mapping):
                     best_fn = best_bid_fns.get(tid)
@@ -1770,16 +1775,18 @@ def main():
                 if info is None or info.price is None or info.price <= 0:
                     continue
                 samples[tid] = float(info.price)
-                pending.discard(tid)
+                seen.add(tid)
 
-            if not pending:
+            all_ready = len(seen) == len([tid for tid in token_ids if tid])
+            if all_ready and attempt + 1 >= need_attempts:
                 break
 
             if attempt == 0:
                 print("[INFO] 正在等待实时买一价刷新，稍后重试…")
             time.sleep(interval)
 
-        return samples, pending
+        missing = {tid for tid in token_ids if tid and tid not in seen}
+        return samples, missing
 
     price_samples, missing_tokens = _collect_price_samples(token_id_list)
 
