@@ -142,6 +142,8 @@ def test_maker_buy_reprices_on_bid_rise():
 
 def test_maker_buy_skips_reprice_when_sum_cap_hit():
     shared_prices: Dict[str, float] = {"other": 0.6}
+    guard = maker.PriceSumArbitrageGuard()
+    guard.commit_price("other", 0.6)
     client = DummyClient(
         status_sequences=[
             [
@@ -164,11 +166,38 @@ def test_maker_buy_skips_reprice_when_sum_cap_hit():
         sleep_fn=lambda _: None,
         shared_active_prices=shared_prices,
         price_update_guard=lambda price_map: sum(price_map.values()) < 1.0,
+        price_sum_guard=guard,
     )
 
-    assert result["filled"] == pytest.approx(1.0)
-    assert shared_prices.get("asset") == pytest.approx(0.5)
-    assert len(client.created_orders) == 1
+    assert result["status"] == "STOPPED"
+    assert result["filled"] == pytest.approx(0.0)
+    assert shared_prices.get("asset") is None
+    assert not client.created_orders
+
+
+def test_maker_buy_stops_when_sum_cap_blocked_before_post():
+    shared_prices: Dict[str, float] = {"other": 0.6}
+    guard = maker.PriceSumArbitrageGuard()
+    guard.commit_price("other", 0.6)
+    client = DummyClient(status_sequences=[[{"status": "OPEN", "filledAmount": 0.0}]])
+
+    bids = _stream([0.45, 0.45])
+
+    result = maker.maker_buy_follow_bid(
+        client,
+        token_id="asset",
+        target_size=1.0,
+        poll_sec=0.0,
+        min_quote_amt=0.0,
+        min_order_size=0.0,
+        best_bid_fn=bids,
+        sleep_fn=lambda _: None,
+        shared_active_prices=shared_prices,
+        price_sum_guard=guard,
+    )
+
+    assert result["status"] == "STOPPED"
+    assert not client.created_orders
 
 
 def test_maker_buy_handles_missing_fill_amount_on_match():
