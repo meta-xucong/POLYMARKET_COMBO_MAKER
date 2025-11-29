@@ -1420,8 +1420,12 @@ class _WsBestBidTracker:
         self._best: Dict[str, float] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._ready = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._error: Optional[Exception] = None
+
+    def _has_all_prices_unlocked(self) -> bool:
+        return all((tid in self._best) and (self._best.get(tid, 0.0) > 0) for tid in self.token_ids)
 
     def _extract_token_id(self, payload: Dict[str, Any]) -> Optional[str]:
         if not isinstance(payload, dict):
@@ -1465,6 +1469,8 @@ class _WsBestBidTracker:
                     continue
                 with self._lock:
                     self._best[token_id] = float(sample.price)
+                    if self._has_all_prices_unlocked():
+                        self._ready.set()
             return
 
         # 兜底：尝试直接从事件顶层提取。
@@ -1476,6 +1482,8 @@ class _WsBestBidTracker:
             return
         with self._lock:
             self._best[token_id] = float(sample.price)
+            if self._has_all_prices_unlocked():
+                self._ready.set()
 
     def start(self) -> bool:
         if ws_watch_by_ids is None:
@@ -1508,6 +1516,20 @@ class _WsBestBidTracker:
         tid = str(token_id).strip()
         with self._lock:
             return self._best.get(tid)
+
+    def wait_until_ready(self, *, timeout: float = 15.0, poll: float = 0.2) -> bool:
+        deadline = time.time() + max(timeout, 0.0)
+        poll = max(poll, 1e-3)
+        while True:
+            if self._has_all_prices_unlocked():
+                self._ready.set()
+                return True
+            if self._stop.is_set():
+                return False
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False
+            self._ready.wait(timeout=min(poll, remaining))
 
     @property
     def error(self) -> Optional[Exception]:
@@ -1723,7 +1745,13 @@ def main():
         tracker = _WsBestBidTracker(token_id_list)
         if tracker.start():
             best_bid_fns = {tid: (lambda tid=tid: tracker.best_bid(tid)) for tid in token_id_list}
-            print("[INFO] 已启动 WS 行情订阅，优先使用实时买一价。")
+            print("[INFO] 已启动 WS 行情订阅，优先使用实时买一价，等待首批报价…")
+            primed = tracker.wait_until_ready(timeout=30.0, poll=0.5)
+            if not primed:
+                tracker.stop()
+                print("[ERR] WS 行情在超时时间内未提供全部子问题的买一价，退出。")
+                return
+            print("[INFO] 已获取所有子问题的实时买一价，开始估算下单份数。")
         else:
             tracker = None
             if not any(token_id_list):
