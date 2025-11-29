@@ -14,7 +14,7 @@ import hmac
 import hashlib
 import json
 import inspect
-from typing import Dict, Any, Tuple, List, Optional, Callable
+from typing import Dict, Any, Tuple, List, Optional, Callable, Mapping
 import threading
 from decimal import Decimal, ROUND_UP, ROUND_DOWN
 import requests
@@ -27,9 +27,12 @@ except Exception:  # pragma: no cover - 兼容无 zoneinfo 的环境
     class ZoneInfoNotFoundError(Exception):
         pass
 from maker_execution import (
-    maker_multi_buy_follow_bid,
-    _extract_best_price,
+    BUY_SIZE_DP,
+    DEFAULT_MIN_ORDER_SIZE,
+    _best_bid_info,
     _coerce_float,
+    _extract_best_price,
+    maker_multi_buy_follow_bid,
 )
 from trading.execution import ClobPolymarketAPI
 try:
@@ -78,8 +81,8 @@ except Exception as e:
 CLOB_API_HOST = "https://clob.polymarket.com"
 GAMMA_ROOT = os.getenv("POLY_GAMMA_ROOT", "https://gamma-api.polymarket.com")
 DATA_API_ROOT = os.getenv("POLY_DATA_API_ROOT", "https://data-api.polymarket.com")
-# 默认不强制设置最低下单份数，避免与按金额倒推的目标相冲突；如需限制可配置。
-API_MIN_ORDER_SIZE = 0.0
+# 强制最低下单份数满足官方要求（不少于 5）。
+API_MIN_ORDER_SIZE = DEFAULT_MIN_ORDER_SIZE
 ORDERBOOK_STALE_AFTER_SEC = 5.0
 POSITION_SYNC_INTERVAL = 60.0
 POST_BUY_POSITION_CHECK_DELAY = 5.0
@@ -1703,7 +1706,7 @@ def main():
         print("[ERR] 未选择任何 token，退出。")
         return
 
-    print("[INFO] 已选择以下子问题/方向，将按统一金额依次买入：")
+    print("[INFO] 已选择以下子问题/方向，将按统一份数依次买入：")
     for idx, entry in enumerate(chosen_tokens):
         name = entry.get("name") or entry.get("title") or entry.get("id") or ""
         token_id = entry.get("id") or entry.get("token_id") or entry.get("market_id") or ""
@@ -1730,20 +1733,73 @@ def main():
     else:
         print("[WARN] WS 行情模块不可用，继续尝试 REST 报价。")
 
-    print("请输入每个子问题的买入金额（USDC，留空则默认按 5 USDC 执行）：")
+    print("请输入本次下单投入的总USDC金额（留空则默认按 5 USDC 执行）：")
     size_raw = input().strip()
-    target_amt: float = 5.0
+    total_budget: float = 5.0
     if size_raw:
         try:
-            target_amt = float(size_raw)
+            total_budget = float(size_raw)
         except Exception:
             print("[ERR] 金额输入非法，退出。")
             return
-        if target_amt <= 0:
+        if total_budget <= 0:
             print("[ERR] 金额必须大于 0。")
             return
 
-    print(f"[RUN] 即将按金额 {target_amt} USDC 仅买入 {len(chosen_tokens)} 个子问题…")
+    print(f"[RUN] 本次总投入 {total_budget} USDC，开始估算每个子问题的下单份数…")
+
+    def _floor_to_size_dp(value: float) -> float:
+        try:
+            quant = Decimal(str(value)).quantize(Decimal(f"1e-{BUY_SIZE_DP}"), rounding=ROUND_DOWN)
+        except Exception:
+            return 0.0
+        return float(quant)
+
+    price_samples: Dict[str, float] = {}
+    for entry in chosen_tokens:
+        token_id = (
+            entry.get("id")
+            or entry.get("token_id")
+            or entry.get("market_id")
+            or entry.get("asset_id")
+        )
+        tid = str(token_id).strip() if token_id is not None else ""
+        if not tid:
+            continue
+        best_fn = None
+        if isinstance(best_bid_fns, Mapping):
+            best_fn = best_bid_fns.get(tid)
+        info = _best_bid_info(client, tid, best_fn)
+        if info is None or info.price is None or info.price <= 0:
+            print(f"[ERR] 无法获取 token_id={tid} 的买一价，退出。")
+            return
+        price_samples[tid] = float(info.price)
+
+    if not price_samples:
+        print("[ERR] 无法为所选子市场获取买一价，退出。")
+        return
+
+    total_price = sum(price_samples.values())
+    if total_price <= 0:
+        print("[ERR] 价格求和异常，退出。")
+        return
+
+    max_affordable_size = total_budget / total_price
+    if max_affordable_size < API_MIN_ORDER_SIZE:
+        required = API_MIN_ORDER_SIZE * total_price
+        print(
+            f"[ERR] 总金额不足以满足每个子市场至少 {API_MIN_ORDER_SIZE} 份的合规要求，"
+            f"当前至少需要约 {required:.2f} USDC，退出。"
+        )
+        return
+
+    target_size = max(_floor_to_size_dp(max_affordable_size), API_MIN_ORDER_SIZE)
+    est_quote = target_size * total_price
+
+    print(
+        f"[PLAN] 当前买一价估算：每个子问题下单 {target_size} 份，总计约 {est_quote:.4f} USDC。"
+    )
+    print(f"[RUN] 即将按统一份数 {target_size} 仅买入 {len(chosen_tokens)} 个子问题…")
 
     latest_state: Dict[str, Dict[str, Any]] = {}
     last_state_log = 0.0
@@ -1849,7 +1905,7 @@ def main():
         summary = maker_multi_buy_follow_bid(
             client,
             chosen_tokens,
-            target_notional=target_amt,
+            target_size=target_size,
             min_quote_amt=1.0,
             min_order_size=API_MIN_ORDER_SIZE,
             progress_probe_interval=10.0,
