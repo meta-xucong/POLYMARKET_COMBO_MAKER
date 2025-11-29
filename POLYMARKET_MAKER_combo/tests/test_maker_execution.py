@@ -493,3 +493,9 @@ def test_multi_buy_waits_for_price_warmup(monkeypatch):
     assert results.get("_meta", {}).get("balance_ok") is True
     assert "NO_PRICE" in (results.get("_meta", {}).get("states") or [])
     assert "PRICE_WARMUP_TIMEOUT" in (results.get("_meta", {}).get("states") or [])
+
+
+def test_best_price_info_filters_placeholder_price():
+    # 0.001 是 WS 初始化常见的占位价，应被视为无效并转为 None。
+    result = maker._best_price_info(object(), "asset", lambda: 0.001, "bid")
+    assert result is None
