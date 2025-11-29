@@ -87,19 +87,20 @@ def ws_watch_by_ids(asset_ids: List[str],
                 sample = _extract_best_price(payload, "bid")
                 if sample is not None and getattr(sample, "price", None):
                     price_val = float(sample.price)
-                    if price_val > 0:
+                    # 忽略明显占位的低价（如 0.01）以避免误判为首条有效买一价。
+                    if price_val > 0.01:
                         return price_val
             except Exception:
                 pass
 
         for key in ("best_bid", "bestBid", "bid", "buy"):
             if key in payload:
-                try:
-                    val = float(payload.get(key))
-                    if val > 0:
-                        return val
-                except Exception:
-                    continue
+                    try:
+                        val = float(payload.get(key))
+                        if val > 0.01:
+                            return val
+                    except Exception:
+                        continue
 
         bids = payload.get("bids")
         if isinstance(bids, list):
@@ -107,7 +108,7 @@ def ws_watch_by_ids(asset_ids: List[str],
                 if isinstance(entry, dict) and "price" in entry:
                     try:
                         val = float(entry.get("price"))
-                        if val > 0:
+                        if val > 0.01:
                             return val
                     except Exception:
                         continue

@@ -1478,9 +1478,11 @@ class _WsBestBidTracker:
                 sample = _extract_best_price(pc, "bid")
                 if sample is None:
                     continue
-                prev = self._best.get(token_id)
+                price_val = float(sample.price)
+                if price_val <= 0.01:
+                    continue
                 with self._lock:
-                    self._best[token_id] = float(sample.price)
+                    self._best[token_id] = price_val
                     evt = self._first_bid_events.get(token_id)
                     if evt:
                         evt.set()
@@ -1502,7 +1504,10 @@ class _WsBestBidTracker:
             return
         prev = self._best.get(token_id)
         with self._lock:
-            self._best[token_id] = float(sample.price)
+            price_val = float(sample.price)
+            if price_val <= 0.01:
+                return
+            self._best[token_id] = price_val
             evt = self._first_bid_events.get(token_id)
             if evt:
                 evt.set()
@@ -1844,7 +1849,35 @@ def main():
             return 0.0
         return float(quant)
 
-    target_size = _floor_to_size_dp(target_size)
+    def _collect_price_samples(
+        token_ids: List[str], retries: int = 6, interval: float = 0.5, min_rounds: int = 2
+    ) -> Tuple[Dict[str, float], set[str]]:
+        """采样实时买一价，至少跑 ``min_rounds`` 轮以防首次取到占位价。"""
+
+        samples: Dict[str, float] = {}
+        seen: set[str] = set()
+        need_attempts = max(int(min_rounds), 1)
+
+        for attempt in range(max(retries, need_attempts)):
+            for tid in token_ids:
+                if not tid:
+                    continue
+                best_fn = None
+                if isinstance(best_bid_fns, Mapping):
+                    best_fn = best_bid_fns.get(tid)
+                info = _best_bid_info(client, tid, best_fn)
+                if info is None or info.price is None or info.price <= 0.01:
+                    continue
+                samples[tid] = float(info.price)
+                seen.add(tid)
+
+            all_ready = len(seen) == len([tid for tid in token_ids if tid])
+            if all_ready and attempt + 1 >= need_attempts:
+                break
+
+            if attempt == 0:
+                print("[INFO] 正在等待实时买一价刷新，稍后重试…")
+            time.sleep(interval)
 
     if target_size < API_MIN_ORDER_SIZE:
         print(
