@@ -20,6 +20,12 @@ try:
 except Exception:
     raise RuntimeError("缺少依赖，请先安装： pip install websocket-client")
 
+try:
+    # 仅用于在 WS 收到首条买一价时打点标记；不依赖于 maker_execution 的其余逻辑。
+    from maker_execution import _extract_best_price  # type: ignore
+except Exception:
+    _extract_best_price = None  # type: ignore
+
 WS_BASE = "wss://ws-subscriptions-clob.polymarket.com"
 CHANNEL = "market"
 
@@ -31,7 +37,8 @@ def ws_watch_by_ids(asset_ids: List[str],
                     label: str = "",
                     on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
                     verbose: bool = False,
-                    stop_event: Optional[threading.Event] = None):
+                    stop_event: Optional[threading.Event] = None,
+                    bid_ready_flags: Optional[Dict[str, threading.Event]] = None):
     """
     只负责：连接 → 订阅 → 将 WS 事件回调给 on_event（逐条 dict）。
     - asset_ids: 订阅的 token_ids（字符串）
@@ -58,6 +65,86 @@ def ws_watch_by_ids(asset_ids: List[str],
         "Origin: https://polymarket.com",
         "User-Agent: Mozilla/5.0",
     ]
+
+    def _extract_token_id(payload: Dict[str, Any]) -> Optional[str]:
+        for key in (
+            "token_id",
+            "tokenId",
+            "id",
+            "market_id",
+            "marketId",
+            "asset_id",
+            "assetId",
+        ):
+            val = payload.get(key)
+            if val:
+                return str(val)
+        return None
+
+    def _extract_bid_price(payload: Dict[str, Any]) -> Optional[float]:
+        if _extract_best_price is not None:
+            try:
+                sample = _extract_best_price(payload, "bid")
+                if sample is not None and getattr(sample, "price", None):
+                    price_val = float(sample.price)
+                    if price_val > 0:
+                        return price_val
+            except Exception:
+                pass
+
+        for key in ("best_bid", "bestBid", "bid", "buy"):
+            if key in payload:
+                try:
+                    val = float(payload.get(key))
+                    if val > 0:
+                        return val
+                except Exception:
+                    continue
+
+        bids = payload.get("bids")
+        if isinstance(bids, list):
+            for entry in bids:
+                if isinstance(entry, dict) and "price" in entry:
+                    try:
+                        val = float(entry.get("price"))
+                        if val > 0:
+                            return val
+                    except Exception:
+                        continue
+        return None
+
+    def _flag_first_bid(payload: Dict[str, Any]):
+        if not bid_ready_flags:
+            return
+        if not isinstance(payload, dict):
+            return
+
+        if payload.get("event_type") == "price_change" or "price_changes" in payload:
+            changes = payload.get("price_changes", [])
+            if isinstance(changes, list):
+                for pc in changes:
+                    if not isinstance(pc, dict):
+                        continue
+                    token_id = _extract_token_id(pc)
+                    if not token_id:
+                        continue
+                    price_val = _extract_bid_price(pc)
+                    if price_val is None:
+                        continue
+                    evt = bid_ready_flags.get(token_id)
+                    if evt:
+                        evt.set()
+            return
+
+        token_id = _extract_token_id(payload)
+        if not token_id:
+            return
+        price_val = _extract_bid_price(payload)
+        if price_val is None:
+            return
+        evt = bid_ready_flags.get(token_id)
+        if evt:
+            evt.set()
 
     while not stop_event.is_set():
         ping_stop = {"v": False}
@@ -86,6 +173,14 @@ def ws_watch_by_ids(asset_ids: List[str],
                 data = json.loads(message)
             except Exception:
                 return
+
+            # 先根据行情事件尝试标记首条买一价。
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        _flag_first_bid(item)
+            elif isinstance(data, dict):
+                _flag_first_bid(data)
 
             # 无回调：仅在 verbose=True 时打印，否则静默
             if on_event is None:
