@@ -201,6 +201,17 @@ def test_maker_buy_stops_when_sum_cap_blocked_before_post():
     assert not client.created_orders
 
 
+def test_price_guard_includes_fills_in_sum():
+    guard = maker.PriceSumArbitrageGuard()
+    # 另一子市场已成交，均价 0.62 应参与总价计算
+    guard.record_fill("filled", 5.0, 0.62)
+
+    # 新的挂单拟以 0.4 挂出，加上 0.62 应触发阈值
+    assert guard.validate_proposed_prices({"active": 0.4}) is False
+    assert guard.should_stop()
+    assert guard.violation_total() == pytest.approx(1.02)
+
+
 def test_maker_buy_handles_missing_fill_amount_on_match():
     client = DummyClient(status_sequences=[[{"status": "MATCHED"}]])
 

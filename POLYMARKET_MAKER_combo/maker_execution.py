@@ -87,6 +87,11 @@ class PriceSumArbitrageGuard:
     def validate_proposed_prices(self, proposed: Mapping[str, float]) -> bool:
         with self._lock:
             total = sum(float(v) for v in proposed.values())
+            # 对已完成/暂未活跃的子市场，使用成交均价参与套利和约束判断
+            for tid, fill in self.fills.items():
+                if tid in proposed:
+                    continue
+                total += float(fill.get("avg_price", 0.0))
             if total >= self.threshold - 1e-12:
                 self._mark_violation(total)
                 return False
@@ -96,6 +101,11 @@ class PriceSumArbitrageGuard:
         with self._lock:
             self.prices[token_id] = float(price)
             total = sum(self.prices.values())
+            # 将已成交仓位的均价也计入总价，避免遗漏已买完子市场
+            for tid, fill in self.fills.items():
+                if tid in self.prices:
+                    continue
+                total += float(fill.get("avg_price", 0.0))
             if total >= self.threshold - 1e-12:
                 self._mark_violation(total)
                 return False
@@ -953,6 +963,12 @@ def maker_buy_follow_bid(
             if status_shortage and status_text_upper not in invalid_states:
                 reason = "[MAKER][BUY] 订单状态提示余额不足，尝试调整买入目标后重试。"
             min_viable = _ceil_to_dp(remaining, size_dp_active)
+            if not status_shortage:
+                # 非余额类错误时，只需满足最小下单量即可尝试缩减目标
+                min_viable = max(
+                    api_min_qty or 0.0,
+                    _ceil_to_dp(float(min_order_size or 0.0), size_dp_active),
+                )
             should_stop = _handle_balance_shortage(reason, min_viable, fatal=status_shortage)
             if should_stop:
                 break
