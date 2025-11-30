@@ -1886,6 +1886,16 @@ def main():
         return
 
     print(f"[RUN] 本次将为每个子问题挂买单 {target_size} 份，共计 {len(chosen_tokens)} 个子问题。")
+    baseline_positions: Dict[str, float] = {}
+    for tid in token_id_list:
+        try:
+            _avg_px, pos_size, origin_note = _lookup_position_avg_price(client, tid)
+            baseline_positions[tid] = float(pos_size or 0.0)
+            if origin_note:
+                print(f"[INFO] 初始仓位 {tid}: {baseline_positions[tid]}（来源：{origin_note}）")
+        except Exception as exc:
+            baseline_positions[tid] = 0.0
+            print(f"[WARN] 查询初始仓位失败（{tid}）：{exc}")
     latest_state: Dict[str, Dict[str, Any]] = {}
     last_state_log = 0.0
 
@@ -1930,6 +1940,7 @@ def main():
 
         adapter = None
         pending_logged = False
+        not_found_counts: Dict[str, int] = {}
 
         while True:
             pending: List[Tuple[str, Dict[str, Any]]] = []
@@ -1961,13 +1972,26 @@ def main():
                     oid = order.get("id") if isinstance(order, dict) else None
                     if not oid:
                         continue
+                    st_text = None
+                    filled_amt = _coerce_float(order.get("filled")) or 0.0
+                    key = f"{mid}:{oid}"
                     try:
                         stat = adapter.get_order_status(str(oid))
+                        st_text = str(stat.get("status", "")).upper()
+                        filled_amt = _coerce_float(stat.get("filledAmount")) or filled_amt
+                        if key in not_found_counts:
+                            not_found_counts.pop(key, None)
                     except Exception as exc:
                         print(f"[WARN] 查询订单状态失败（{mid} | {oid}）：{exc}")
+                        detail = str(exc).lower()
+                        if "not found" in detail or "404" in detail:
+                            not_found_counts[key] = not_found_counts.get(key, 0) + 1
+                            if not_found_counts[key] >= 3:
+                                st_text = "CANCELLED"
+                        else:
+                            not_found_counts[key] = 0
+                    if st_text is None:
                         continue
-                    st_text = str(stat.get("status", "")).upper()
-                    filled_amt = _coerce_float(stat.get("filledAmount")) or 0.0
                     order["status"] = st_text or order.get("status")
                     order["filled"] = filled_amt
                     if st_text in {"FILLED", "MATCHED", "COMPLETED", "EXECUTED"}:
@@ -1986,6 +2010,75 @@ def main():
 
         return summary
 
+    token_entry_map = {
+        str(entry.get("id") or entry.get("token_id") or entry.get("market_id") or "").strip(): entry
+        for entry in chosen_tokens
+    }
+
+    def _fetch_total_position(token_id: str) -> Tuple[float, str]:
+        try:
+            _avg_px, pos_size, origin_note = _lookup_position_avg_price(client, token_id)
+            return float(pos_size or 0.0), origin_note or ""
+        except Exception as exc:
+            return 0.0, f"查询失败: {exc}"
+
+    def _ensure_targets_filled(summary: Dict[str, Any]) -> Dict[str, Any]:
+        eps = 1e-6
+        desired_totals = {
+            tid: baseline_positions.get(tid, 0.0) + target_size for tid in token_id_list if tid
+        }
+
+        while True:
+            missing: List[Tuple[str, float, float, str]] = []
+            for tid, goal in desired_totals.items():
+                current, origin_note = _fetch_total_position(tid)
+                res = summary.get(tid, {}).get("result") if isinstance(summary.get(tid), dict) else {}
+                status_hint = res.get("status") if isinstance(res, dict) else None
+                if current + eps >= goal:
+                    continue
+                remaining_need = goal - current
+                missing.append((tid, remaining_need, current, origin_note or status_hint or ""))
+
+            if not missing:
+                return summary
+
+            print("[VERIFY] 检测到仍有目标未达成，准备重新挂单：")
+            for tid, need, current, origin in missing:
+                print(
+                    f"  token_id={tid} | 现有仓位={current:.4f} | 目标={desired_totals.get(tid, 0):.4f} | "
+                    f"待补={need:.4f} | 状态线索={origin}"
+                )
+
+            for tid, need, current, origin in missing:
+                entry = token_entry_map.get(tid, {"id": tid, "name": token_display_names.get(tid, tid)})
+                order_size = max(float(need), API_MIN_ORDER_SIZE)
+                per_token_best = None
+                if isinstance(best_bid_fns, Mapping):
+                    per_token_best = {tid: best_bid_fns.get(tid)}
+                print(
+                    f"[RETRY] 针对 token_id={tid} 再次挂单 {order_size:.4f} 份"
+                    f"（当前 {current:.4f}，目标 {desired_totals.get(tid, 0):.4f}）"
+                )
+                retry_summary = maker_multi_buy_follow_bid(
+                    client,
+                    [entry],
+                    target_size=order_size,
+                    min_quote_amt=1.0,
+                    min_order_size=API_MIN_ORDER_SIZE,
+                    progress_probe_interval=10.0,
+                    state_callback=_print_state,
+                    best_bid_fns=per_token_best,
+                )
+                retry_summary = _wait_until_orders_done(retry_summary)
+                for mid, payload in retry_summary.items():
+                    if mid == "_meta":
+                        continue
+                    summary[mid] = payload
+
+            time.sleep(2.0)
+
+        return summary
+
     try:
         summary = maker_multi_buy_follow_bid(
             client,
@@ -1998,6 +2091,7 @@ def main():
             best_bid_fns=best_bid_fns,
         )
         summary = _wait_until_orders_done(summary)
+        summary = _ensure_targets_filled(summary)
     except Exception as exc:
         print(f"[ERR] 下单过程中出现异常：{exc}")
         return
