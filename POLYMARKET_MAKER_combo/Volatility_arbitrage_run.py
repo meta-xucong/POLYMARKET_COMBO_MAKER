@@ -36,9 +36,10 @@ from maker_execution import (
 )
 from trading.execution import ClobPolymarketAPI
 try:
-    from Volatility_arbitrage_main_ws import ws_watch_by_ids
+    from Volatility_arbitrage_main_ws import ws_watch_by_ids, WsBestBidTracker
 except Exception:
     ws_watch_by_ids = None
+    WsBestBidTracker = None  # type: ignore
 
 # ========== 1) Client：优先 ws 版，回退 rest 版 ==========
 def _get_client():
@@ -1412,269 +1413,6 @@ def _prompt_token_selection(candidates: List[Dict[str, str]]) -> List[Dict[str, 
         return selected
 
 
-class _WsBestBidTracker:
-    """轻量级 WS 订阅器，用于追踪子问题的实时买一价。"""
-
-    def __init__(
-        self,
-        token_ids: List[str],
-        client: Any,
-        *,
-        on_bid_change: Optional[Callable[[str, float, Optional[float]], None]] = None,
-        position_refresher: Optional[Callable[[], None]] = None,
-        rest_refresh_interval: float = 60.0,
-    ):
-        self.token_ids = [str(tid).strip() for tid in token_ids if tid]
-        self._client = client
-        self._best: Dict[str, float] = {}
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._ready = threading.Event()
-        self._first_bid_events: Dict[str, threading.Event] = {
-            tid: threading.Event() for tid in self.token_ids
-        }
-        self._thread: Optional[threading.Thread] = None
-        self._rest_guard_thread: Optional[threading.Thread] = None
-        self._error: Optional[Exception] = None
-        self._on_bid_change = on_bid_change
-        self._position_refresher = position_refresher
-        self._rest_refresh_interval = max(rest_refresh_interval, 5.0)
-        self._last_ws_message_at = time.time()
-        self._last_rest_refresh_at = 0.0
-
-    def set_on_bid_change(self, handler: Optional[Callable[[str, float, Optional[float]], None]]) -> None:
-        self._on_bid_change = handler
-
-    def set_position_refresher(self, handler: Optional[Callable[[], None]]) -> None:
-        self._position_refresher = handler
-
-    def _has_all_prices_unlocked(self) -> bool:
-        if self._first_bid_events:
-            return all(evt.is_set() for evt in self._first_bid_events.values())
-        return all((tid in self._best) and (self._best.get(tid, 0.0) > 0) for tid in self.token_ids)
-
-    def _extract_token_id(self, payload: Dict[str, Any]) -> Optional[str]:
-        if not isinstance(payload, dict):
-            return None
-        for key in (
-            "token_id",
-            "tokenId",
-            "id",
-            "market_id",
-            "marketId",
-            "asset_id",
-            "assetId",
-        ):
-            val = payload.get(key)
-            if val:
-                return str(val)
-        return None
-
-    def _on_event(self, event: Dict[str, Any]) -> None:
-        """Handle raw WS events and capture best bid by token.
-
-        The WS ``market`` channel usually wraps updates in a ``price_changes``
-        array (``{"event_type": "price_change", "price_changes": [...]}``).
-        The original脚本会下钻这个列表逐条提取 ``asset_id``，而新版最初版本仅尝试
-        在顶层查找 ``token_id``，导致无法从行情事件中拿到买一价。这里复刻原版行
-        为：优先遍历 ``price_changes``，否则退回直接解析顶层事件。
-        """
-
-        if not isinstance(event, dict):
-            return
-
-        # 优先处理 price_changes 列表（与原版一致）。
-        if event.get("event_type") == "price_change" or "price_changes" in event:
-            changes = event.get("price_changes", [])
-            for pc in changes if isinstance(changes, list) else []:
-                token_id = self._extract_token_id(pc)
-                if not token_id:
-                    continue
-                sample = _extract_best_price(pc, "bid")
-                if sample is None:
-                    continue
-                price_val = float(sample.price)
-                if price_val <= 0.01:
-                    continue
-                prev = None
-                with self._lock:
-                    prev = self._best.get(token_id)
-                self._last_ws_message_at = time.time()
-                with self._lock:
-                    self._best[token_id] = price_val
-                    evt = self._first_bid_events.get(token_id)
-                    if evt:
-                        evt.set()
-                    if self._has_all_prices_unlocked():
-                        self._ready.set()
-                if self._on_bid_change and (prev is None or abs(prev - float(sample.price)) > 1e-12):
-                    try:
-                        self._on_bid_change(token_id, float(sample.price), prev)
-                    except Exception:
-                        pass
-            return
-
-        # 兜底：尝试直接从事件顶层提取。
-        token_id = self._extract_token_id(event)
-        if not token_id:
-            return
-        sample = _extract_best_price(event, "bid")
-        if sample is None:
-            return
-        prev = self._best.get(token_id)
-        self._last_ws_message_at = time.time()
-        with self._lock:
-            price_val = float(sample.price)
-            if price_val <= 0.01:
-                return
-            self._best[token_id] = price_val
-            evt = self._first_bid_events.get(token_id)
-            if evt:
-                evt.set()
-            if self._has_all_prices_unlocked():
-                self._ready.set()
-        if self._on_bid_change and (prev is None or abs(prev - float(sample.price)) > 1e-12):
-            try:
-                self._on_bid_change(token_id, float(sample.price), prev)
-            except Exception:
-                pass
-
-    def _refresh_best_via_rest(self, *, announce: bool = False) -> bool:
-        """使用 REST 报价补齐/刷新买一价，并在缺少 WS 时避免卡死。"""
-
-        if self._client is None:
-            return False
-
-        updated = False
-        now = time.time()
-        for tid in self.token_ids:
-            try:
-                info = _best_bid_info(self._client, tid, None)
-            except Exception as exc:
-                if announce:
-                    print(f"[WARN] REST 补价失败（{tid}）：{exc}")
-                continue
-            if info is None or info.price is None or info.price <= 0.01:
-                continue
-
-            prev = None
-            with self._lock:
-                prev = self._best.get(tid)
-                self._best[tid] = float(info.price)
-                evt = self._first_bid_events.get(tid)
-                if evt:
-                    evt.set()
-                if self._has_all_prices_unlocked():
-                    self._ready.set()
-            updated = True
-            if self._on_bid_change and (prev is None or abs(prev - float(info.price)) > 1e-12):
-                try:
-                    self._on_bid_change(tid, float(info.price), prev)
-                except Exception:
-                    pass
-
-        if updated:
-            self._last_rest_refresh_at = now
-            if announce:
-                print("[INFO] 已使用 REST 报价刷新最新买一价，等待 WS 行情继续更新…")
-            if self._position_refresher:
-                try:
-                    self._position_refresher()
-                except Exception:
-                    pass
-        return updated
-
-    def start(self) -> bool:
-        if ws_watch_by_ids is None:
-            return False
-        if not self.token_ids:
-            return False
-
-        # 启动 WS 前先用 REST 拉取一次报价，避免初始阶段无价可用。
-        self._refresh_best_via_rest(announce=True)
-
-        def _runner():
-            try:
-                ws_watch_by_ids(
-                    self.token_ids,
-                    label="maker-best-bid",
-                    on_event=self._on_event,
-                    verbose=False,
-                    stop_event=self._stop,
-                    bid_ready_flags=self._first_bid_events,
-                )
-            except Exception as exc:  # pragma: no cover - 依赖网络环境
-                self._error = exc
-
-        def _rest_guard():
-            while not self._stop.is_set():
-                time.sleep(5.0)
-                idle = time.time() - self._last_ws_message_at
-                if idle < self._rest_refresh_interval:
-                    continue
-                recently_refreshed = time.time() - self._last_rest_refresh_at < self._rest_refresh_interval
-                if recently_refreshed:
-                    continue
-                refreshed = self._refresh_best_via_rest(announce=True)
-                if refreshed:
-                    self._last_ws_message_at = time.time()
-
-        self._thread = threading.Thread(target=_runner, daemon=True)
-        self._thread.start()
-        self._rest_guard_thread = threading.Thread(target=_rest_guard, daemon=True)
-        self._rest_guard_thread.start()
-        return True
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=1.0)
-        if self._rest_guard_thread and self._rest_guard_thread.is_alive():
-            self._rest_guard_thread.join(timeout=1.0)
-
-    def best_bid(self, token_id: str) -> Optional[float]:
-        tid = str(token_id).strip()
-        with self._lock:
-            return self._best.get(tid)
-
-    def wait_until_ready(self, *, timeout: float = 15.0, poll: float = 0.2) -> bool:
-        missing = self.wait_for_first_bids(timeout=timeout, poll=poll)
-        return not missing
-
-    def wait_for_first_bids(self, *, timeout: Optional[float] = 15.0, poll: float = 0.2) -> set[str]:
-        """等待首条买一价就绪。
-
-        当 ``timeout`` 为 ``None`` 时将一直等待直到全部 token 收到首价。
-        返回值为在超时时仍未就绪的 token_id 集合；当 timeout=None 时，始终返回空集。
-        """
-
-        poll = max(poll, 1e-3)
-        deadline = None if timeout is None else time.time() + max(timeout, 0.0)
-        remaining_tokens: set[str] = set(self.token_ids)
-
-        while remaining_tokens:
-            if deadline is not None:
-                now = time.time()
-                if now >= deadline:
-                    break
-                wait_time = min(poll, max(deadline - now, 0.0))
-            else:
-                wait_time = poll
-
-            for tid in list(remaining_tokens):
-                evt = self._first_bid_events.get(tid)
-                if evt is None:
-                    continue
-                if evt.wait(timeout=wait_time):
-                    remaining_tokens.discard(tid)
-            if self._has_all_prices_unlocked():
-                remaining_tokens.clear()
-                break
-        return remaining_tokens if deadline is not None else set()
-
-    @property
-    def error(self) -> Optional[Exception]:
-        return self._error
 
 def _looks_like_event_source(source: str) -> bool:
     """Return True when *source* clearly refers to an event rather than a market."""
@@ -1880,7 +1618,7 @@ def main():
         for entry in chosen_tokens
     ]
 
-    tracker: Optional[_WsBestBidTracker] = None
+    tracker: Optional[WsBestBidTracker] = None
     best_bid_fns: Optional[Dict[str, Callable[[], Optional[float]]]] = None
     token_display_names = {
         str(entry.get("id") or entry.get("token_id") or entry.get("market_id") or ""): (
@@ -1888,8 +1626,8 @@ def main():
         )
         for entry in chosen_tokens
     }
-    if ws_watch_by_ids is not None:
-        tracker = _WsBestBidTracker(token_id_list, client)
+    if ws_watch_by_ids is not None and WsBestBidTracker is not None:
+        tracker = WsBestBidTracker(token_id_list, client)
         if tracker.start():
             print("[INFO] 已启动 WS 行情订阅，优先使用实时买一价，等待首批报价…")
             wait_attempt = 0

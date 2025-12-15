@@ -23,8 +23,10 @@ except Exception:
 try:
     # 仅用于在 WS 收到首条买一价时打点标记；不依赖于 maker_execution 的其余逻辑。
     from maker_execution import _extract_best_price  # type: ignore
+    from maker_execution import _best_bid_info  # type: ignore
 except Exception:
     _extract_best_price = None  # type: ignore
+    _best_bid_info = None  # type: ignore
 
 WS_BASE = "wss://ws-subscriptions-clob.polymarket.com"
 CHANNEL = "market"
@@ -146,6 +148,257 @@ def ws_watch_by_ids(asset_ids: List[str],
         evt = bid_ready_flags.get(token_id)
         if evt:
             evt.set()
+
+
+class WsBestBidTracker:
+    """轻量级 WS 订阅器，用于追踪子问题的实时买一价，并在无行情时通过 REST 补价。"""
+
+    def __init__(
+        self,
+        token_ids: List[str],
+        client: Any,
+        *,
+        on_bid_change: Optional[Callable[[str, float, Optional[float]], None]] = None,
+        position_refresher: Optional[Callable[[], None]] = None,
+        rest_refresh_interval: float = 60.0,
+    ):
+        self.token_ids = [str(tid).strip() for tid in token_ids if tid]
+        self._client = client
+        self._best: Dict[str, float] = {}
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._first_bid_events: Dict[str, threading.Event] = {
+            tid: threading.Event() for tid in self.token_ids
+        }
+        self._thread: Optional[threading.Thread] = None
+        self._rest_guard_thread: Optional[threading.Thread] = None
+        self._error: Optional[Exception] = None
+        self._on_bid_change = on_bid_change
+        self._position_refresher = position_refresher
+        self._rest_refresh_interval = max(rest_refresh_interval, 5.0)
+        self._last_ws_message_at = time.time()
+        self._last_rest_refresh_at = 0.0
+
+    def set_on_bid_change(self, handler: Optional[Callable[[str, float, Optional[float]], None]]) -> None:
+        self._on_bid_change = handler
+
+    def set_position_refresher(self, handler: Optional[Callable[[], None]]) -> None:
+        self._position_refresher = handler
+
+    def _has_all_prices_unlocked(self) -> bool:
+        if self._first_bid_events:
+            return all(evt.is_set() for evt in self._first_bid_events.values())
+        return all((tid in self._best) and (self._best.get(tid, 0.0) > 0) for tid in self.token_ids)
+
+    def _extract_token_id(self, payload: Dict[str, Any]) -> Optional[str]:
+        if not isinstance(payload, dict):
+            return None
+        for key in (
+            "token_id",
+            "tokenId",
+            "id",
+            "market_id",
+            "marketId",
+            "asset_id",
+            "assetId",
+        ):
+            val = payload.get(key)
+            if val:
+                return str(val)
+        return None
+
+    def _on_event(self, event: Dict[str, Any]) -> None:
+        if not isinstance(event, dict):
+            return
+
+        if event.get("event_type") == "price_change" or "price_changes" in event:
+            changes = event.get("price_changes", [])
+            if isinstance(changes, list):
+                for pc in changes:
+                    if not isinstance(pc, dict):
+                        continue
+                    token_id = self._extract_token_id(pc)
+                    if not token_id:
+                        continue
+                    sample = _extract_best_price(pc, "bid") if _extract_best_price else None
+                    if sample is None:
+                        continue
+                    try:
+                        price_val = float(sample.price)
+                    except Exception:
+                        continue
+                    if price_val <= 0.01:
+                        continue
+                    with self._lock:
+                        prev = self._best.get(token_id)
+                    self._last_ws_message_at = time.time()
+                    with self._lock:
+                        self._best[token_id] = price_val
+                        evt = self._first_bid_events.get(token_id)
+                        if evt:
+                            evt.set()
+                        if self._has_all_prices_unlocked():
+                            self._ready.set()
+                    if self._on_bid_change and (prev is None or abs(prev - float(sample.price)) > 1e-12):
+                        try:
+                            self._on_bid_change(token_id, float(sample.price), prev)
+                        except Exception:
+                            pass
+                return
+
+        token_id = self._extract_token_id(event)
+        if not token_id:
+            return
+        sample = _extract_best_price(event, "bid") if _extract_best_price else None
+        if sample is None:
+            return
+        prev = self._best.get(token_id)
+        self._last_ws_message_at = time.time()
+        with self._lock:
+            price_val = float(sample.price)
+            if price_val <= 0.01:
+                return
+            self._best[token_id] = price_val
+            evt = self._first_bid_events.get(token_id)
+            if evt:
+                evt.set()
+            if self._has_all_prices_unlocked():
+                self._ready.set()
+        if self._on_bid_change and (prev is None or abs(prev - float(sample.price)) > 1e-12):
+            try:
+                self._on_bid_change(token_id, float(sample.price), prev)
+            except Exception:
+                pass
+
+    def _refresh_best_via_rest(self, *, announce: bool = False) -> bool:
+        if self._client is None or _best_bid_info is None:
+            return False
+
+        updated = False
+        now = time.time()
+        for tid in self.token_ids:
+            try:
+                info = _best_bid_info(self._client, tid, None)
+            except Exception as exc:
+                if announce:
+                    print(f"[WARN] REST 补价失败（{tid}）：{exc}")
+                continue
+            if info is None or info.price is None or info.price <= 0.01:
+                continue
+
+            prev = None
+            with self._lock:
+                prev = self._best.get(tid)
+                self._best[tid] = float(info.price)
+                evt = self._first_bid_events.get(tid)
+                if evt:
+                    evt.set()
+                if self._has_all_prices_unlocked():
+                    self._ready.set()
+            updated = True
+            if self._on_bid_change and (prev is None or abs(prev - float(info.price)) > 1e-12):
+                try:
+                    self._on_bid_change(tid, float(info.price), prev)
+                except Exception:
+                    pass
+
+        if updated:
+            self._last_rest_refresh_at = now
+            if announce:
+                print("[INFO] 已使用 REST 报价刷新最新买一价，等待 WS 行情继续更新…")
+            if self._position_refresher:
+                try:
+                    self._position_refresher()
+                except Exception:
+                    pass
+        return updated
+
+    def start(self) -> bool:
+        if not self.token_ids:
+            return False
+
+        self._refresh_best_via_rest(announce=True)
+
+        def _runner():
+            try:
+                ws_watch_by_ids(
+                    self.token_ids,
+                    label="maker-best-bid",
+                    on_event=self._on_event,
+                    verbose=False,
+                    stop_event=self._stop,
+                    bid_ready_flags=self._first_bid_events,
+                )
+            except Exception as exc:
+                self._error = exc
+
+        def _rest_guard():
+            while not self._stop.is_set():
+                time.sleep(5.0)
+                idle = time.time() - self._last_ws_message_at
+                if idle < self._rest_refresh_interval:
+                    continue
+                recently_refreshed = time.time() - self._last_rest_refresh_at < self._rest_refresh_interval
+                if recently_refreshed:
+                    continue
+                refreshed = self._refresh_best_via_rest(announce=True)
+                if refreshed:
+                    self._last_ws_message_at = time.time()
+
+        self._thread = threading.Thread(target=_runner, daemon=True)
+        self._rest_guard_thread = threading.Thread(target=_rest_guard, daemon=True)
+        self._thread.start()
+        self._rest_guard_thread.start()
+        return True
+
+    def wait_until_ready(self, timeout: Optional[float]) -> bool:
+        missing = self.wait_for_first_bids(timeout=timeout, poll=0.2)
+        return not missing
+
+    def wait_for_first_bids(self, *, timeout: Optional[float] = 15.0, poll: float = 0.2) -> set[str]:
+        poll = max(poll, 1e-3)
+        deadline = None if timeout is None else time.time() + max(timeout, 0.0)
+        remaining_tokens: set[str] = set(self.token_ids)
+
+        while remaining_tokens:
+            if deadline is not None:
+                now = time.time()
+                if now >= deadline:
+                    break
+                wait_time = min(poll, max(deadline - now, 0.0))
+            else:
+                wait_time = poll
+
+            for tid in list(remaining_tokens):
+                evt = self._first_bid_events.get(tid)
+                if evt is None:
+                    continue
+                if evt.wait(timeout=wait_time):
+                    remaining_tokens.discard(tid)
+            if self._has_all_prices_unlocked():
+                remaining_tokens.clear()
+                break
+        return remaining_tokens if deadline is not None else set()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        if self._rest_guard_thread and self._rest_guard_thread.is_alive():
+            self._rest_guard_thread.join(timeout=1.0)
+
+    @property
+    def error(self) -> Optional[Exception]:
+        return self._error
+
+    def best_bid(self, token_id: str) -> Optional[float]:
+        tid = str(token_id).strip()
+        with self._lock:
+            return self._best.get(tid)
+
+    def all_ready(self) -> bool:
+        return self._has_all_prices_unlocked()
 
     while not stop_event.is_set():
         ping_stop = {"v": False}
