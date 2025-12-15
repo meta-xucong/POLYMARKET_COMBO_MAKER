@@ -1809,6 +1809,8 @@ def main():
             print("[INFO] 已启动 WS 行情订阅，优先使用实时买一价，等待首批报价…")
             wait_attempt = 0
             max_wait_rounds = 3  # 兜底：最多等待 3 个周期后继续执行，避免卡死在份数输入前。
+            max_wait_seconds = 20.0  # 二次兜底：总等待时间上限，避免 WS 异常导致长时间无法输入份数。
+            wait_started_at = time.time()
             while True:
                 missing_bids = tracker.wait_for_first_bids(timeout=10.0, poll=0.5)
                 if not missing_bids:
@@ -1817,11 +1819,22 @@ def main():
 
                 names = [token_display_names.get(tid, tid) for tid in sorted(missing_bids)]
                 wait_attempt += 1
+                if tracker.error:
+                    print(
+                        "[WARN] WS 行情订阅遇到异常，已切换为 REST 报价：",
+                        tracker.error,
+                    )
+                    break
                 if wait_attempt >= max_wait_rounds:
                     print(
                         "[WARN] 部分子问题的首条买一价长期未就绪：",
                         ", ".join(names),
                         "；将继续执行并在缺价处退回 REST 报价。",
+                    )
+                    break
+                if time.time() - wait_started_at >= max_wait_seconds:
+                    print(
+                        "[WARN] WS 行情等待超过时限（约 20s），继续执行并退回 REST 报价。"
                     )
                     break
                 print(
