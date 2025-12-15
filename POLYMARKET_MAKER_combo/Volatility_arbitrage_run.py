@@ -1807,6 +1807,8 @@ def main():
         tracker = _WsBestBidTracker(token_id_list)
         if tracker.start():
             print("[INFO] 已启动 WS 行情订阅，优先使用实时买一价，等待首批报价…")
+            wait_attempt = 0
+            max_wait_rounds = 3  # 兜底：最多等待 3 个周期后继续执行，避免卡死在份数输入前。
             while True:
                 missing_bids = tracker.wait_for_first_bids(timeout=10.0, poll=0.5)
                 if not missing_bids:
@@ -1814,6 +1816,14 @@ def main():
                     break
 
                 names = [token_display_names.get(tid, tid) for tid in sorted(missing_bids)]
+                wait_attempt += 1
+                if wait_attempt >= max_wait_rounds:
+                    print(
+                        "[WARN] 部分子问题的首条买一价长期未就绪：",
+                        ", ".join(names),
+                        "；将继续执行并在缺价处退回 REST 报价。",
+                    )
+                    break
                 print(
                     "[INFO] 首条买一价仍在等待，尚未就绪的子问题：",
                     ", ".join(names),
