@@ -177,7 +177,9 @@ class WsBestBidTracker:
         self._on_bid_change = on_bid_change
         self._position_refresher = position_refresher
         self._rest_refresh_interval = max(rest_refresh_interval, 5.0)
-        self._last_ws_message_at = time.time()
+        # 如果 WS 始终无消息，默认值为 0 便于守护线程迅速触发 REST 补价，
+        # 避免长时间等待后才尝试回落到 REST。
+        self._last_ws_message_at = 0.0
         self._last_rest_refresh_at = 0.0
 
     def set_on_bid_change(self, handler: Optional[Callable[[str, float, Optional[float]], None]]) -> None:
@@ -285,6 +287,8 @@ class WsBestBidTracker:
                     print(f"[WARN] REST 补价失败（{tid}）：{exc}")
                 continue
             if info is None or info.price is None or info.price <= 0.01:
+                if announce:
+                    print(f"[WARN] REST 未返回有效买一价（{tid}）")
                 continue
 
             prev = None
@@ -305,6 +309,7 @@ class WsBestBidTracker:
 
         if updated:
             self._last_rest_refresh_at = now
+            self._last_ws_message_at = now
             if announce:
                 print("[INFO] 已使用 REST 报价刷新最新买一价，等待 WS 行情继续更新…")
             if self._position_refresher:
@@ -312,6 +317,8 @@ class WsBestBidTracker:
                     self._position_refresher()
                 except Exception:
                     pass
+        elif announce:
+            print("[WARN] REST 补价未能获取任何子问题的有效买一价，将继续尝试…")
         return updated
 
     def start(self) -> bool:
