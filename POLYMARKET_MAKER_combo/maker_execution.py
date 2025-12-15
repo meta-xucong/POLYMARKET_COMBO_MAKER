@@ -272,30 +272,36 @@ def _extract_best_price(payload: Any, side: str) -> Optional[PriceSample]:
 
 def _fetch_best_price(client: Any, token_id: str, side: str) -> Optional[PriceSample]:
     method_candidates = (
-        ("get_market_orderbook", {"market": token_id}),
-        ("get_market_orderbook", {"token_id": token_id}),
-        ("get_market_orderbook", {"market_id": token_id}),
-        ("get_order_book", {"market": token_id}),
-        ("get_order_book", {"token_id": token_id}),
-        ("get_orderbook", {"market": token_id}),
-        ("get_orderbook", {"token_id": token_id}),
-        ("get_market", {"market": token_id}),
-        ("get_market", {"token_id": token_id}),
-        ("get_market_data", {"market": token_id}),
-        ("get_market_data", {"token_id": token_id}),
-        ("get_ticker", {"market": token_id}),
-        ("get_ticker", {"token_id": token_id}),
-        ("get_price", {"token_id": token_id, "side": "SELL" if side == "bid" else "BUY"}),
+        ("get_market_orderbook", {"market": token_id}, False),
+        ("get_market_orderbook", {"token_id": token_id}, False),
+        ("get_market_orderbook", {"market_id": token_id}, False),
+        ("get_order_book", {"token_id": token_id}, True),
+        ("get_order_book", {"market": token_id}, False),
+        ("get_orderbook", {"token_id": token_id}, True),
+        ("get_orderbook", {"market": token_id}, False),
+        ("get_market", {"market": token_id}, False),
+        ("get_market", {"token_id": token_id}, False),
+        ("get_market_data", {"market": token_id}, False),
+        ("get_market_data", {"token_id": token_id}, False),
+        ("get_ticker", {"market": token_id}, False),
+        ("get_ticker", {"token_id": token_id}, False),
+        ("get_price", {"token_id": token_id, "side": "SELL" if side == "bid" else "BUY"}, False),
     )
 
-    for name, kwargs in method_candidates:
+    for name, kwargs, allow_positional in method_candidates:
         fn = getattr(client, name, None)
         if not callable(fn):
             continue
         try:
             resp = fn(**kwargs)
         except TypeError:
-            continue
+            if allow_positional:
+                try:
+                    resp = fn(token_id)
+                except Exception:
+                    continue
+            else:
+                continue
         except Exception:
             continue
 
