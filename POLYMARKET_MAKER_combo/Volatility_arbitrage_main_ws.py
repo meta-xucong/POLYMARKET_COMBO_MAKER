@@ -153,6 +153,101 @@ def ws_watch_by_ids(asset_ids: List[str],
         if evt:
             evt.set()
 
+    while not stop_event.is_set():
+        ping_stop = {"v": False}
+
+        def on_open(ws):
+            nonlocal reconnect_delay
+            if verbose:
+                print(f"[{_now()}][WS][OPEN] -> {WS_BASE+'/ws/'+CHANNEL}")
+            payload = {"type": CHANNEL, "assets_ids": ids}
+            ws.send(json.dumps(payload))
+            reconnect_delay = 1
+
+            # 文本心跳 PING（与底层 ping 帧并行存在）
+            def _ping():
+                while not ping_stop["v"] and not stop_event.is_set():
+                    try:
+                        ws.send("PING")
+                        time.sleep(10)
+                    except Exception:
+                        break
+            threading.Thread(target=_ping, daemon=True).start()
+
+        def on_message(ws, message):
+            # 忽略非 JSON 文本（如 PONG）
+            try:
+                data = json.loads(message)
+            except Exception:
+                return
+
+            # 先根据行情事件尝试标记首条买一价。
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        _flag_first_bid(item)
+            elif isinstance(data, dict):
+                _flag_first_bid(data)
+
+            # 无回调：仅在 verbose=True 时打印，否则静默
+            if on_event is None:
+                if verbose:
+                    print(f"[{_now()}][WS][EVENT] {data}")
+                return
+
+            # 逐条回调
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        try:
+                            on_event(item)
+                        except Exception:
+                            pass
+            elif isinstance(data, dict):
+                try:
+                    on_event(data)
+                except Exception:
+                    pass
+
+        def on_error(ws, error):
+            if verbose:
+                print(f"[{_now()}][WS][ERROR] {error}")
+
+        def on_close(ws, status_code, msg):
+            ping_stop["v"] = True
+            if verbose:
+                print(f"[{_now()}][WS][CLOSED] {status_code} {msg}")
+
+        wsa = websocket.WebSocketApp(
+            WS_BASE + "/ws/" + CHANNEL,
+            on_open=on_open,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close,
+            header=headers,
+        )
+
+        try:
+            wsa.run_forever(
+                sslopt={"cert_reqs": ssl.CERT_REQUIRED},
+                ping_interval=25,
+                ping_timeout=10,
+            )
+        except Exception as exc:
+            ping_stop["v"] = True
+            if verbose:
+                print(f"[{_now()}][WS][EXCEPTION] {exc}")
+        finally:
+            ping_stop["v"] = True
+
+        if stop_event.is_set():
+            break
+
+        if verbose:
+            print(f"[{_now()}][WS] 连接结束，{reconnect_delay}s 后重试…")
+        time.sleep(reconnect_delay)
+        reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
+
 
 class WsBestBidTracker:
     """轻量级 WS 订阅器，用于追踪子问题的实时买一价，并在无行情时通过 REST 补价。"""
@@ -417,101 +512,6 @@ class WsBestBidTracker:
 
     def all_ready(self) -> bool:
         return self._has_all_prices_unlocked()
-
-    while not stop_event.is_set():
-        ping_stop = {"v": False}
-
-        def on_open(ws):
-            nonlocal reconnect_delay
-            if verbose:
-                print(f"[{_now()}][WS][OPEN] -> {WS_BASE+'/ws/'+CHANNEL}")
-            payload = {"type": CHANNEL, "assets_ids": ids}
-            ws.send(json.dumps(payload))
-            reconnect_delay = 1
-
-            # 文本心跳 PING（与底层 ping 帧并行存在）
-            def _ping():
-                while not ping_stop["v"] and not stop_event.is_set():
-                    try:
-                        ws.send("PING")
-                        time.sleep(10)
-                    except Exception:
-                        break
-            threading.Thread(target=_ping, daemon=True).start()
-
-        def on_message(ws, message):
-            # 忽略非 JSON 文本（如 PONG）
-            try:
-                data = json.loads(message)
-            except Exception:
-                return
-
-            # 先根据行情事件尝试标记首条买一价。
-            if isinstance(data, list):
-                for item in data:
-                    if isinstance(item, dict):
-                        _flag_first_bid(item)
-            elif isinstance(data, dict):
-                _flag_first_bid(data)
-
-            # 无回调：仅在 verbose=True 时打印，否则静默
-            if on_event is None:
-                if verbose:
-                    print(f"[{_now()}][WS][EVENT] {data}")
-                return
-
-            # 逐条回调
-            if isinstance(data, list):
-                for item in data:
-                    if isinstance(item, dict):
-                        try:
-                            on_event(item)
-                        except Exception:
-                            pass
-            elif isinstance(data, dict):
-                try:
-                    on_event(data)
-                except Exception:
-                    pass
-
-        def on_error(ws, error):
-            if verbose:
-                print(f"[{_now()}][WS][ERROR] {error}")
-
-        def on_close(ws, status_code, msg):
-            ping_stop["v"] = True
-            if verbose:
-                print(f"[{_now()}][WS][CLOSED] {status_code} {msg}")
-
-        wsa = websocket.WebSocketApp(
-            WS_BASE + "/ws/" + CHANNEL,
-            on_open=on_open,
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close,
-            header=headers,
-        )
-
-        try:
-            wsa.run_forever(
-                sslopt={"cert_reqs": ssl.CERT_REQUIRED},
-                ping_interval=25,
-                ping_timeout=10,
-            )
-        except Exception as exc:
-            ping_stop["v"] = True
-            if verbose:
-                print(f"[{_now()}][WS][EXCEPTION] {exc}")
-        finally:
-            ping_stop["v"] = True
-
-        if stop_event.is_set():
-            break
-
-        if verbose:
-            print(f"[{_now()}][WS] 连接结束，{reconnect_delay}s 后重试…")
-        time.sleep(reconnect_delay)
-        reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
 
 # --- 仅供独立运行调试 ---
 def _parse_cli(argv: List[str]) -> Optional[str]:

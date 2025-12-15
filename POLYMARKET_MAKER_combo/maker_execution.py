@@ -237,8 +237,8 @@ def _extract_best_price(payload: Any, side: str) -> Optional[PriceSample]:
                     return extracted
 
         ladder_keys = {
-            "bid": ("bids", "bid_levels", "buy_orders", "buyOrders"),
-            "ask": ("asks", "ask_levels", "sell_orders", "sellOrders", "offers"),
+            "bid": ("bids", "bid_levels", "buy_orders", "buyOrders", "buys"),
+            "ask": ("asks", "ask_levels", "sell_orders", "sellOrders", "offers", "sells"),
         }[side]
         for key in ladder_keys:
             if key in payload:
@@ -285,6 +285,7 @@ def _fetch_best_price(client: Any, token_id: str, side: str) -> Optional[PriceSa
         ("get_market_data", {"token_id": token_id}),
         ("get_ticker", {"market": token_id}),
         ("get_ticker", {"token_id": token_id}),
+        ("get_price", {"token_id": token_id, "side": "SELL" if side == "bid" else "BUY"}),
     )
 
     for name, kwargs in method_candidates:
