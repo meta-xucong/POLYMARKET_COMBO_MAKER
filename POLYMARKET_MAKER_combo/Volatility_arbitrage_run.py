@@ -37,9 +37,11 @@ from maker_execution import (
 from trading.execution import ClobPolymarketAPI
 try:
     from Volatility_arbitrage_main_ws import ws_watch_by_ids, WsBestBidTracker
-except Exception:
+    _ws_import_error: Optional[Exception] = None
+except Exception as exc:  # pragma: no cover - 捕获环境缺依赖等异常
     ws_watch_by_ids = None
     WsBestBidTracker = None  # type: ignore
+    _ws_import_error = exc
 
 # ========== 1) Client：优先 ws 版，回退 rest 版 ==========
 def _get_client():
@@ -1673,7 +1675,8 @@ def main():
             else:
                 print("[WARN] WS 行情订阅未启动，继续尝试 REST 报价。")
     else:
-        print("[WARN] WS 行情模块不可用，继续尝试 REST 报价。")
+        suffix = f"（原因：{_ws_import_error}）" if '_ws_import_error' in globals() and _ws_import_error else ""
+        print(f"[WARN] WS 行情模块不可用，继续尝试 REST 报价。{suffix}")
 
     print("请输入本次每个子问题的下单份数（留空则默认按 5 份执行）：")
     size_raw = input().strip()
