@@ -237,8 +237,8 @@ def _extract_best_price(payload: Any, side: str) -> Optional[PriceSample]:
                     return extracted
 
         ladder_keys = {
-            "bid": ("bids", "bid_levels", "buy_orders", "buyOrders"),
-            "ask": ("asks", "ask_levels", "sell_orders", "sellOrders", "offers"),
+            "bid": ("bids", "bid_levels", "buy_orders", "buyOrders", "buys"),
+            "ask": ("asks", "ask_levels", "sell_orders", "sellOrders", "offers", "sells"),
         }[side]
         for key in ladder_keys:
             if key in payload:
@@ -272,29 +272,36 @@ def _extract_best_price(payload: Any, side: str) -> Optional[PriceSample]:
 
 def _fetch_best_price(client: Any, token_id: str, side: str) -> Optional[PriceSample]:
     method_candidates = (
-        ("get_market_orderbook", {"market": token_id}),
-        ("get_market_orderbook", {"token_id": token_id}),
-        ("get_market_orderbook", {"market_id": token_id}),
-        ("get_order_book", {"market": token_id}),
-        ("get_order_book", {"token_id": token_id}),
-        ("get_orderbook", {"market": token_id}),
-        ("get_orderbook", {"token_id": token_id}),
-        ("get_market", {"market": token_id}),
-        ("get_market", {"token_id": token_id}),
-        ("get_market_data", {"market": token_id}),
-        ("get_market_data", {"token_id": token_id}),
-        ("get_ticker", {"market": token_id}),
-        ("get_ticker", {"token_id": token_id}),
+        ("get_market_orderbook", {"market": token_id}, False),
+        ("get_market_orderbook", {"token_id": token_id}, False),
+        ("get_market_orderbook", {"market_id": token_id}, False),
+        ("get_order_book", {"token_id": token_id}, True),
+        ("get_order_book", {"market": token_id}, False),
+        ("get_orderbook", {"token_id": token_id}, True),
+        ("get_orderbook", {"market": token_id}, False),
+        ("get_market", {"market": token_id}, False),
+        ("get_market", {"token_id": token_id}, False),
+        ("get_market_data", {"market": token_id}, False),
+        ("get_market_data", {"token_id": token_id}, False),
+        ("get_ticker", {"market": token_id}, False),
+        ("get_ticker", {"token_id": token_id}, False),
+        ("get_price", {"token_id": token_id, "side": "SELL" if side == "bid" else "BUY"}, False),
     )
 
-    for name, kwargs in method_candidates:
+    for name, kwargs, allow_positional in method_candidates:
         fn = getattr(client, name, None)
         if not callable(fn):
             continue
         try:
             resp = fn(**kwargs)
         except TypeError:
-            continue
+            if allow_positional:
+                try:
+                    resp = fn(token_id)
+                except Exception:
+                    continue
+            else:
+                continue
         except Exception:
             continue
 
@@ -1166,6 +1173,9 @@ def maker_multi_buy_follow_bid(
 
     entries = [(entry, *_parse_market_entry(entry)) for entry in submarkets]
 
+    warmup_missing: List[str] = []
+    warmup_timeout_hit = False
+
     if preload_best_bids:
         pending: Dict[str, Optional[Callable[[], Optional[float]]]] = {}
         for entry, mid, _ in entries:
@@ -1193,6 +1203,16 @@ def maker_multi_buy_follow_bid(
                 if not pending:
                     break
                 now = time.time()
+                if now - start >= price_warmup_timeout:
+                    waiting = sorted(pending.keys())
+                    warmup_missing = waiting
+                    warmup_timeout_hit = True
+                    print(
+                        "[WARN] 报价预热已等待约 {:.0f}s，仍未获取：{}；将继续执行并在缺价处尝试即时补价。".format(
+                            now - start, ", ".join(waiting) or "无"
+                        )
+                    )
+                    break
                 if now - last_heartbeat >= heartbeat_interval:
                     obtained = sorted(set(shared_active_prices.keys()) & pending_ids)
                     waiting = sorted(pending.keys())
@@ -1203,6 +1223,14 @@ def maker_multi_buy_follow_bid(
                     )
                     last_heartbeat = now
                 time.sleep(poll_interval)
+
+    if warmup_timeout_hit and warmup_missing:
+        summary["_meta"] = {
+            "states": ["NO_PRICE", "PRICE_WARMUP_TIMEOUT"],
+            "balance_ok": True,
+            "missing_quotes": warmup_missing,
+        }
+        return summary
 
     threads: List[threading.Thread] = []
     for entry, mid, label in entries:
