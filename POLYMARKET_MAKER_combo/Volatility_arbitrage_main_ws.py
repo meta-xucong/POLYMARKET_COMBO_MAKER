@@ -31,6 +31,10 @@ except Exception:
 WS_BASE = "wss://ws-subscriptions-clob.polymarket.com"
 CHANNEL = "market"
 
+# 与 maker_execution._best_price_info 的校验阈值保持一致，避免把 0.001 这类有效价
+# 当成占位值过滤掉，导致首价迟迟无法解锁。
+MIN_VALID_BID = 0.001
+
 def _now() -> str:
     from datetime import datetime
     return datetime.now().strftime("%H:%M:%S")
@@ -89,8 +93,8 @@ def ws_watch_by_ids(asset_ids: List[str],
                 sample = _extract_best_price(payload, "bid")
                 if sample is not None and getattr(sample, "price", None):
                     price_val = float(sample.price)
-                    # 忽略明显占位的低价（如 0.01）以避免误判为首条有效买一价。
-                    if price_val > 0.01:
+                    # 忽略明显占位的低价（如 0.000x），以免误判为首条有效买一价。
+                    if price_val > MIN_VALID_BID:
                         return price_val
             except Exception:
                 pass
@@ -99,7 +103,7 @@ def ws_watch_by_ids(asset_ids: List[str],
             if key in payload:
                     try:
                         val = float(payload.get(key))
-                        if val > 0.01:
+                        if val > MIN_VALID_BID:
                             return val
                     except Exception:
                         continue
@@ -110,7 +114,7 @@ def ws_watch_by_ids(asset_ids: List[str],
                 if isinstance(entry, dict) and "price" in entry:
                     try:
                         val = float(entry.get("price"))
-                        if val > 0.01:
+                        if val > MIN_VALID_BID:
                             return val
                     except Exception:
                         continue
@@ -230,7 +234,7 @@ class WsBestBidTracker:
                         price_val = float(sample.price)
                     except Exception:
                         continue
-                    if price_val <= 0.01:
+                    if price_val <= MIN_VALID_BID:
                         continue
                     with self._lock:
                         prev = self._best.get(token_id)
@@ -259,7 +263,7 @@ class WsBestBidTracker:
         self._last_ws_message_at = time.time()
         with self._lock:
             price_val = float(sample.price)
-            if price_val <= 0.01:
+            if price_val <= MIN_VALID_BID:
                 return
             self._best[token_id] = price_val
             evt = self._first_bid_events.get(token_id)
@@ -286,7 +290,7 @@ class WsBestBidTracker:
                 if announce:
                     print(f"[WARN] REST 补价失败（{tid}）：{exc}")
                 continue
-            if info is None or info.price is None or info.price <= 0.01:
+            if info is None or info.price is None or info.price <= MIN_VALID_BID:
                 if announce:
                     print(f"[WARN] REST 未返回有效买一价（{tid}）")
                 continue
@@ -344,11 +348,18 @@ class WsBestBidTracker:
             while not self._stop.is_set():
                 time.sleep(5.0)
                 idle = time.time() - self._last_ws_message_at
-                if idle < self._rest_refresh_interval:
+
+                # 开盘初期或 WS 长时间缺失，都用更快的节奏尝试 REST 补价，确保首价就绪
+                # 不被 60s 的间隔拖慢。成功后再回到正常刷新周期。
+                interval = 10.0 if not self._has_all_prices_unlocked() else self._rest_refresh_interval
+
+                if idle < interval:
                     continue
-                recently_refreshed = time.time() - self._last_rest_refresh_at < self._rest_refresh_interval
+
+                recently_refreshed = time.time() - self._last_rest_refresh_at < interval
                 if recently_refreshed:
                     continue
+
                 refreshed = self._refresh_best_via_rest(announce=True)
                 if refreshed:
                     self._last_ws_message_at = time.time()
