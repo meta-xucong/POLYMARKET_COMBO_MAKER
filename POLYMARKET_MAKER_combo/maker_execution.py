@@ -52,10 +52,10 @@ class PriceSumArbitrageGuard:
     """Track working maker prices and stop when the sum crosses the cap.
 
     该守卫用于跨市场的套利校验：如果所有挂单价格之和达到或超过设定阈值
-    （默认 1.0），则触发停止信号，供上层统一撤单或转入卖出流程。
+    （默认 0.99），则触发停止信号，供上层统一撤单或转入卖出流程。
     """
 
-    def __init__(self, *, threshold: float = 1.0) -> None:
+    def __init__(self, *, threshold: float = 0.99) -> None:
         self.threshold = float(threshold)
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -1056,6 +1056,7 @@ def maker_multi_buy_follow_bid(
     preload_best_bids: bool = True,
     price_warmup_timeout: float = 30.0,
     price_warmup_poll: float = 0.5,
+    price_sum_threshold: float = 0.99,
     **kwargs: Any,
 ) -> Dict[str, Dict[str, Any]]:
     """在多个子市场按相同逻辑挂买单。
@@ -1076,7 +1077,7 @@ def maker_multi_buy_follow_bid(
     summary: Dict[str, Dict[str, Any]] = {}
     lock = threading.Lock()
     shared_active_prices: Dict[str, float] = {}
-    price_guard = PriceSumArbitrageGuard()
+    price_guard = PriceSumArbitrageGuard(threshold=price_sum_threshold)
 
     def _wrap_stop_check(user_stop: Optional[Callable[[], bool]]) -> Callable[[], bool]:
         def _combined() -> bool:
@@ -1229,6 +1230,7 @@ def maker_multi_buy_follow_bid(
             "states": ["NO_PRICE", "PRICE_WARMUP_TIMEOUT"],
             "balance_ok": True,
             "missing_quotes": warmup_missing,
+            "price_sum_threshold": price_sum_threshold,
         }
         return summary
 
@@ -1241,39 +1243,6 @@ def maker_multi_buy_follow_bid(
     for t in threads:
         t.join()
 
-    if price_guard.should_stop() and price_guard.violation_total() is not None:
-        filled_entries: List[Tuple[str, float, float]] = []
-        for mid, payload in summary.items():
-            if mid is None or mid == "_meta":
-                continue
-            res = payload.get("result") if isinstance(payload, Mapping) else None
-            if not isinstance(res, Mapping):
-                continue
-            filled_size = float(res.get("filled_size") or 0.0)
-            avg_price = _coerce_float(res.get("avg_price"))
-            if avg_price is None:
-                fill_snapshot = price_guard.fills.get(mid)
-                if fill_snapshot is not None:
-                    avg_price = _coerce_float(fill_snapshot.get("avg_price"))
-            if filled_size > _MIN_FILL_EPS and avg_price is not None:
-                filled_entries.append((mid, filled_size, avg_price))
-
-        if not filled_entries:
-            print("此时所有子市场price之和大于1，已不满足套利条件，程序停止")
-            raise SystemExit("arbitrage condition violated")
-
-        for mid, size, avg in filled_entries:
-            floor_px = float(avg) * 1.001
-            maker_sell_follow_ask_with_floor_wait(
-                client,
-                token_id=mid,
-                position_size=size,
-                floor_X=floor_px,
-                min_order_size=kwargs.get("min_order_size", DEFAULT_MIN_ORDER_SIZE),
-            )
-        print("此时所有子市场price之和大于1，已不满足套利条件，现有仓位已全部卖出，程序停止")
-        raise SystemExit("arbitrage condition violated with fills unwound")
-
     states: List[str] = []
     for mid, payload in summary.items():
         if mid is None:
@@ -1281,7 +1250,26 @@ def maker_multi_buy_follow_bid(
         res = payload.get("result") if isinstance(payload, Mapping) else None
         if isinstance(res, Mapping) and "status" in res:
             states.append(str(res.get("status")))
-    summary["_meta"] = {"states": states, "balance_ok": True}
+
+    violation_total = price_guard.violation_total()
+    meta_payload: Dict[str, Any] = {
+        "states": states,
+        "balance_ok": True,
+        "price_sum_threshold": price_guard.threshold,
+    }
+    if violation_total is not None:
+        meta_payload["price_sum_total"] = violation_total
+
+    if price_guard.should_stop() and violation_total is not None:
+        meta_payload["price_sum_violation"] = True
+        summary["_meta"] = meta_payload
+        raise SystemExit(
+            "price sum {:.4f} >= threshold {:.4f}, maker buying stopped".format(
+                violation_total, price_guard.threshold
+            )
+        )
+
+    summary["_meta"] = meta_payload
 
     return summary
 

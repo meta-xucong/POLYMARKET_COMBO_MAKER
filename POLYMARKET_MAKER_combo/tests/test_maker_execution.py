@@ -201,6 +201,15 @@ def test_maker_buy_stops_when_sum_cap_blocked_before_post():
     assert not client.created_orders
 
 
+def test_price_guard_uses_99pct_cap():
+    guard = maker.PriceSumArbitrageGuard()
+
+    assert guard.threshold == pytest.approx(0.99)
+    assert guard.validate_proposed_prices({"a": 0.5, "b": 0.48}) is True
+    assert guard.validate_proposed_prices({"a": 0.5, "b": 0.5}) is False
+    assert guard.should_stop() is True
+
+
 def test_price_guard_includes_fills_in_sum():
     guard = maker.PriceSumArbitrageGuard()
     # 另一子市场已成交，均价 0.62 应参与总价计算
