@@ -512,6 +512,7 @@ def maker_buy_follow_bid(
     last_shrink_time = 0.0
 
     no_fill_poll_count = 0
+    order_missing_streak = 0
 
     next_probe_at = 0.0
 
@@ -780,6 +781,7 @@ def maker_buy_follow_bid(
             accounted[order_id] = 0.0
             active_order = order_id
             active_price = px
+            order_missing_streak = 0
             _reset_shortage_recovery("[MAKER][BUY] 挂单成功，退出余额不足重试模式。")
             if shared_active_prices is not None:
                 shared_active_prices[token_id] = float(px)
@@ -820,6 +822,14 @@ def maker_buy_follow_bid(
         except Exception as exc:
             print(f"[MAKER][BUY] 查询订单状态异常：{exc}")
             status_payload = {"status": "UNKNOWN", "filledAmount": accounted.get(active_order, 0.0)}
+            detail = str(getattr(exc, "args", ["UNKNOWN"]) or "").lower()
+            if "not found" in detail or "404" in detail:
+                order_missing_streak += 1
+                status_payload["status"] = "NOT_FOUND"
+            else:
+                order_missing_streak = 0
+        else:
+            order_missing_streak = 0
 
         record = records.get(active_order)
         status_text = str(status_payload.get("status", "UNKNOWN"))
@@ -869,31 +879,44 @@ def maker_buy_follow_bid(
         else:
             no_fill_poll_count = 0
         if shortage_retry_count > 0 and no_fill_poll_count >= 30:
-            print(
-                "[MAKER][BUY] 挂单连续 30 次未检测到新增成交，强制校对仓位/余额后重挂。"
-            )
-            if external_fill_probe is not None:
-                try:
-                    external_filled = external_fill_probe()
-                except Exception as probe_exc:
-                    print(f"[MAKER][BUY] 外部持仓校对异常：{probe_exc}")
-                    external_filled = None
-                if external_filled is not None and external_filled > filled_total + _MIN_FILL_EPS:
-                    filled_total = external_filled
-                    print(
-                        f"[MAKER][BUY] 二次校对后更新累计成交 -> filled={filled_total:.{size_dp_active}f}"
-                    )
-            remaining = _remaining_qty_est(current_bid)
-            _cancel_order(client, active_order)
-            rec = records.get(active_order)
-            if rec is not None:
-                rec["status"] = "CANCELLED"
-            active_order = None
-            active_price = None
-            no_fill_poll_count = 0
-            continue
+            status_shortage_live = _is_insufficient_balance(status_payload) or _is_insufficient_balance(status_text)
+            if not status_shortage_live:
+                _reset_shortage_recovery(
+                    "[MAKER][BUY] 连续未成交但未检测到余额问题，退出余额重试模式，保持挂单。"
+                )
+                no_fill_poll_count = 0
+            else:
+                print(
+                    "[MAKER][BUY] 挂单连续 30 次未检测到新增成交，强制校对仓位/余额后重挂。"
+                )
+                if external_fill_probe is not None:
+                    try:
+                        external_filled = external_fill_probe()
+                    except Exception as probe_exc:
+                        print(f"[MAKER][BUY] 外部持仓校对异常：{probe_exc}")
+                        external_filled = None
+                    if external_filled is not None and external_filled > filled_total + _MIN_FILL_EPS:
+                        filled_total = external_filled
+                        print(
+                            f"[MAKER][BUY] 二次校对后更新累计成交 -> filled={filled_total:.{size_dp_active}f}"
+                        )
+                remaining = _remaining_qty_est(current_bid)
+                _cancel_order(client, active_order)
+                rec = records.get(active_order)
+                if rec is not None:
+                    rec["status"] = "CANCELLED"
+                active_order = None
+                active_price = None
+                no_fill_poll_count = 0
+                continue
         remaining = _remaining_qty_est(current_bid)
         status_text_upper = status_text.upper()
+        if status_text_upper == "NOT_FOUND" and order_missing_streak >= 3:
+            print(
+                f"[MAKER][BUY] 订单 {active_order} 连续查询未找到，标记为已撤销并重新评估。"
+            )
+            status_text_upper = "CANCELLED"
+            status_text = "CANCELLED"
         if record is not None:
             record["filled"] = filled_amount
             record["status"] = status_text_upper
@@ -978,6 +1001,7 @@ def maker_buy_follow_bid(
             active_price = None
             continue
         if status_text_upper in cancel_states:
+            order_missing_streak = 0
             active_order = None
             active_price = None
             continue
