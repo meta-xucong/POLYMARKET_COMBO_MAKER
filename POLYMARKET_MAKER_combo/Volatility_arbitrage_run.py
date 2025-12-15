@@ -1416,9 +1416,16 @@ class _WsBestBidTracker:
     """轻量级 WS 订阅器，用于追踪子问题的实时买一价。"""
 
     def __init__(
-        self, token_ids: List[str], *, on_bid_change: Optional[Callable[[str, float, Optional[float]], None]] = None
+        self,
+        token_ids: List[str],
+        client: Any,
+        *,
+        on_bid_change: Optional[Callable[[str, float, Optional[float]], None]] = None,
+        position_refresher: Optional[Callable[[], None]] = None,
+        rest_refresh_interval: float = 60.0,
     ):
         self.token_ids = [str(tid).strip() for tid in token_ids if tid]
+        self._client = client
         self._best: Dict[str, float] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -1427,11 +1434,19 @@ class _WsBestBidTracker:
             tid: threading.Event() for tid in self.token_ids
         }
         self._thread: Optional[threading.Thread] = None
+        self._rest_guard_thread: Optional[threading.Thread] = None
         self._error: Optional[Exception] = None
         self._on_bid_change = on_bid_change
+        self._position_refresher = position_refresher
+        self._rest_refresh_interval = max(rest_refresh_interval, 5.0)
+        self._last_ws_message_at = time.time()
+        self._last_rest_refresh_at = 0.0
 
     def set_on_bid_change(self, handler: Optional[Callable[[str, float, Optional[float]], None]]) -> None:
         self._on_bid_change = handler
+
+    def set_position_refresher(self, handler: Optional[Callable[[], None]]) -> None:
+        self._position_refresher = handler
 
     def _has_all_prices_unlocked(self) -> bool:
         if self._first_bid_events:
@@ -1481,6 +1496,10 @@ class _WsBestBidTracker:
                 price_val = float(sample.price)
                 if price_val <= 0.01:
                     continue
+                prev = None
+                with self._lock:
+                    prev = self._best.get(token_id)
+                self._last_ws_message_at = time.time()
                 with self._lock:
                     self._best[token_id] = price_val
                     evt = self._first_bid_events.get(token_id)
@@ -1503,6 +1522,7 @@ class _WsBestBidTracker:
         if sample is None:
             return
         prev = self._best.get(token_id)
+        self._last_ws_message_at = time.time()
         with self._lock:
             price_val = float(sample.price)
             if price_val <= 0.01:
@@ -1519,11 +1539,59 @@ class _WsBestBidTracker:
             except Exception:
                 pass
 
+    def _refresh_best_via_rest(self, *, announce: bool = False) -> bool:
+        """使用 REST 报价补齐/刷新买一价，并在缺少 WS 时避免卡死。"""
+
+        if self._client is None:
+            return False
+
+        updated = False
+        now = time.time()
+        for tid in self.token_ids:
+            try:
+                info = _best_bid_info(self._client, tid, None)
+            except Exception as exc:
+                if announce:
+                    print(f"[WARN] REST 补价失败（{tid}）：{exc}")
+                continue
+            if info is None or info.price is None or info.price <= 0.01:
+                continue
+
+            prev = None
+            with self._lock:
+                prev = self._best.get(tid)
+                self._best[tid] = float(info.price)
+                evt = self._first_bid_events.get(tid)
+                if evt:
+                    evt.set()
+                if self._has_all_prices_unlocked():
+                    self._ready.set()
+            updated = True
+            if self._on_bid_change and (prev is None or abs(prev - float(info.price)) > 1e-12):
+                try:
+                    self._on_bid_change(tid, float(info.price), prev)
+                except Exception:
+                    pass
+
+        if updated:
+            self._last_rest_refresh_at = now
+            if announce:
+                print("[INFO] 已使用 REST 报价刷新最新买一价，等待 WS 行情继续更新…")
+            if self._position_refresher:
+                try:
+                    self._position_refresher()
+                except Exception:
+                    pass
+        return updated
+
     def start(self) -> bool:
         if ws_watch_by_ids is None:
             return False
         if not self.token_ids:
             return False
+
+        # 启动 WS 前先用 REST 拉取一次报价，避免初始阶段无价可用。
+        self._refresh_best_via_rest(announce=True)
 
         def _runner():
             try:
@@ -1538,14 +1606,31 @@ class _WsBestBidTracker:
             except Exception as exc:  # pragma: no cover - 依赖网络环境
                 self._error = exc
 
+        def _rest_guard():
+            while not self._stop.is_set():
+                time.sleep(5.0)
+                idle = time.time() - self._last_ws_message_at
+                if idle < self._rest_refresh_interval:
+                    continue
+                recently_refreshed = time.time() - self._last_rest_refresh_at < self._rest_refresh_interval
+                if recently_refreshed:
+                    continue
+                refreshed = self._refresh_best_via_rest(announce=True)
+                if refreshed:
+                    self._last_ws_message_at = time.time()
+
         self._thread = threading.Thread(target=_runner, daemon=True)
         self._thread.start()
+        self._rest_guard_thread = threading.Thread(target=_rest_guard, daemon=True)
+        self._rest_guard_thread.start()
         return True
 
     def stop(self) -> None:
         self._stop.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1.0)
+        if self._rest_guard_thread and self._rest_guard_thread.is_alive():
+            self._rest_guard_thread.join(timeout=1.0)
 
     def best_bid(self, token_id: str) -> Optional[float]:
         tid = str(token_id).strip()
@@ -1804,7 +1889,7 @@ def main():
         for entry in chosen_tokens
     }
     if ws_watch_by_ids is not None:
-        tracker = _WsBestBidTracker(token_id_list)
+        tracker = _WsBestBidTracker(token_id_list, client)
         if tracker.start():
             print("[INFO] 已启动 WS 行情订阅，优先使用实时买一价，等待首批报价…")
             wait_attempt = 0
@@ -1910,6 +1995,7 @@ def main():
 
     print(f"[RUN] 本次将为每个子问题挂买单 {target_size} 份，共计 {len(chosen_tokens)} 个子问题。")
     baseline_positions: Dict[str, float] = {}
+    latest_positions: Dict[str, float] = {}
     for tid in token_id_list:
         try:
             _avg_px, pos_size, origin_note = _lookup_position_avg_price(client, tid)
@@ -1919,6 +2005,23 @@ def main():
         except Exception as exc:
             baseline_positions[tid] = 0.0
             print(f"[WARN] 查询初始仓位失败（{tid}）：{exc}")
+
+    def _refresh_positions_via_rest() -> None:
+        updates: List[str] = []
+        for tid in token_id_list:
+            if not tid:
+                continue
+            try:
+                _avg_px, pos_size, origin_note = _lookup_position_avg_price(client, tid)
+                latest_positions[tid] = float(pos_size or 0.0)
+                updates.append(f"{tid}={latest_positions[tid]:.4f}")
+            except Exception as exc:
+                updates.append(f"{tid}=查询失败({exc})")
+        if updates:
+            print("[INFO] 已通过 REST 同步仓位信息：" + ", ".join(updates))
+
+    if tracker is not None:
+        tracker.set_position_refresher(_refresh_positions_via_rest)
     latest_state: Dict[str, Dict[str, Any]] = {}
     last_state_log = 0.0
 
