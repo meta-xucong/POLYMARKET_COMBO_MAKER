@@ -90,7 +90,7 @@
 - **作用**：
   - `maker_buy_follow_bid`：在买一价挂单并随行就市上调，直到完成目标买量或低于最小下单份数。
   - `maker_sell_follow_ask_with_floor_wait`：在卖一价与给定 floor 之间跟单，跌破 floor 时撤单等待回升。
-  - `PriceSumArbitrageGuard`：跟踪多市场的挂单价格，当价格之和达到阈值时触发停止信号，避免跨市场价格合计超过 1.0。
+  - `PriceSumArbitrageGuard`：跟踪多市场的挂单价格，当价格之和达到阈值时触发停止信号，避免跨市场价格合计超过 0.99。
 - **特点**：优先使用外部提供的 WS 最优价函数；缺失时回退到 REST 查询，返回值包含成交统计供策略层更新状态。
 
 ### 6. 拆单与重试引擎（`trading/execution.py`）
