@@ -1941,6 +1941,8 @@ def main():
         adapter = None
         pending_logged = False
         not_found_counts: Dict[str, int] = {}
+        max_pending_wait = 180.0
+        pending_started_at = None
 
         while True:
             pending: List[Tuple[str, Dict[str, Any]]] = []
@@ -1954,10 +1956,15 @@ def main():
                 orders = res.get("orders") if isinstance(res.get("orders"), list) else []
                 if not _is_terminal(status_val) and orders:
                     pending.append((mid, res))
+                if not _is_terminal(status_val) and not orders:
+                    # 没有任何订单记录时直接将状态设为取消，避免卡死
+                    res["status"] = "CANCELLED"
 
             if not pending:
                 break
 
+            if pending_started_at is None:
+                pending_started_at = time.time()
             if adapter is None:
                 adapter = ClobPolymarketAPI(client)
             if not pending_logged:
@@ -2005,6 +2012,16 @@ def main():
                 if "filled" not in res or res.get("filled") is None:
                     res["filled"] = filled_snapshot
                 res["status"] = final_status
+
+            if pending_started_at and time.time() - pending_started_at >= max_pending_wait:
+                print(
+                    f"[WAIT][TIMEOUT] 订单等待已超过 {max_pending_wait:.0f}s，标记未终态订单为 CANCELLED 并继续后续校验。"
+                )
+                for mid, res in pending:
+                    if not _is_terminal(res.get("status")):
+                        res["status"] = "CANCELLED"
+                        res["orders"] = res.get("orders") or []
+                break
 
             time.sleep(2.0)
 
