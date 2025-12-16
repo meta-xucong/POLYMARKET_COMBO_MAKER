@@ -182,6 +182,25 @@ def _infer_price_decimals(value: Any, *, max_dp: int = 6) -> Optional[int]:
 
 
 def _extract_best_price(payload: Any, side: str) -> Optional[PriceSample]:
+    def _is_directionally_incompatible(obj: Mapping[str, Any], side: str) -> bool:
+        """Return True if payload side information conflicts with the target side."""
+
+        side_val = obj.get("side") or obj.get("order_side") or obj.get("orderSide")
+        if isinstance(side_val, str):
+            normalized = side_val.strip().lower()
+            bid_aliases = {"bid", "buy", "b"}
+            ask_aliases = {"ask", "sell", "offer", "s"}
+            if normalized in bid_aliases | ask_aliases:
+                return (side == "bid" and normalized in ask_aliases) or (
+                    side == "ask" and normalized in bid_aliases
+                )
+
+        is_buy = obj.get("isBuy")
+        if isinstance(is_buy, bool):
+            return (side == "bid" and not is_buy) or (side == "ask" and is_buy)
+
+        return False
+
     def _is_pending_state(obj: Mapping[str, Any]) -> bool:
         """Detect pending/initializing states where prices are unreliable."""
 
@@ -201,14 +220,19 @@ def _extract_best_price(payload: Any, side: str) -> Optional[PriceSample]:
             return True
         return False
 
-    numeric = _coerce_float(payload)
-    if numeric is not None:
-        decimals = _infer_price_decimals(payload)
-        return PriceSample(float(numeric), decimals)
-
     if isinstance(payload, Mapping):
         if _is_pending_state(payload):
             return None
+
+        if _is_directionally_incompatible(payload, side):
+            return None
+
+        if "price" in payload:
+            candidate = _coerce_float(payload.get("price"))
+            if candidate is not None:
+                decimals = _infer_price_decimals(payload.get("price"))
+                return PriceSample(float(candidate), decimals)
+
         primary_keys = {
             "bid": (
                 "best_bid",
@@ -246,6 +270,8 @@ def _extract_best_price(payload: Any, side: str) -> Optional[PriceSample]:
                 if isinstance(ladder, Iterable) and not isinstance(ladder, (str, bytes, bytearray)):
                     for entry in ladder:
                         if isinstance(entry, Mapping) and "price" in entry:
+                            if _is_directionally_incompatible(entry, side):
+                                continue
                             decimals = _infer_price_decimals(entry.get("price"))
                             candidate = _coerce_float(entry.get("price"))
                             if candidate is not None:
@@ -254,7 +280,40 @@ def _extract_best_price(payload: Any, side: str) -> Optional[PriceSample]:
                         if extracted is not None:
                             return extracted
 
-        for value in payload.values():
+        opposite_keys = {
+            "bid": {
+                "ask",
+                "asks",
+                "ask_levels",
+                "sell_orders",
+                "sellorders",
+                "offers",
+                "sells",
+                "best_ask",
+                "bestask",
+                "offer",
+                "best_offer",
+                "bestoffer",
+                "lowestask",
+                "sell",
+            },
+            "ask": {
+                "bid",
+                "bids",
+                "bid_levels",
+                "buy_orders",
+                "buyorders",
+                "buys",
+                "best_bid",
+                "bestbid",
+                "buy",
+                "highestbid",
+            },
+        }[side]
+
+        for key, value in payload.items():
+            if isinstance(key, str) and key.strip().lower() in opposite_keys:
+                continue
             extracted = _extract_best_price(value, side)
             if extracted is not None:
                 return extracted
@@ -266,6 +325,11 @@ def _extract_best_price(payload: Any, side: str) -> Optional[PriceSample]:
             if extracted is not None:
                 return extracted
         return None
+
+    numeric = _coerce_float(payload)
+    if numeric is not None:
+        decimals = _infer_price_decimals(payload)
+        return PriceSample(float(numeric), decimals)
 
     return None
 
