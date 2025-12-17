@@ -181,7 +181,7 @@ def _infer_price_decimals(value: Any, *, max_dp: int = 6) -> Optional[int]:
     return min(-int(exponent), max_dp)
 
 
-def _extract_best_price(payload: Any, side: str) -> Optional[PriceSample]:
+def _extract_best_price(payload: Any, side: str, *, allow_price_leaf: bool = False) -> Optional[PriceSample]:
     def _is_directionally_incompatible(obj: Mapping[str, Any], side: str) -> bool:
         """Return True if payload side information conflicts with the target side."""
 
@@ -250,7 +250,7 @@ def _extract_best_price(payload: Any, side: str) -> Optional[PriceSample]:
         }[side]
         for key in primary_keys:
             if key in payload:
-                extracted = _extract_best_price(payload[key], side)
+                extracted = _extract_best_price(payload[key], side, allow_price_leaf=True)
                 if extracted is not None:
                     return extracted
 
@@ -270,7 +270,7 @@ def _extract_best_price(payload: Any, side: str) -> Optional[PriceSample]:
                             candidate = _coerce_float(entry.get("price"))
                             if candidate is not None:
                                 return PriceSample(float(candidate), decimals)
-                        extracted = _extract_best_price(entry, side)
+                        extracted = _extract_best_price(entry, side, allow_price_leaf=True)
                         if extracted is not None:
                             return extracted
 
@@ -308,28 +308,32 @@ def _extract_best_price(payload: Any, side: str) -> Optional[PriceSample]:
         for key, value in payload.items():
             if isinstance(key, str) and key.strip().lower() in opposite_keys:
                 continue
-            extracted = _extract_best_price(value, side)
+            extracted = _extract_best_price(value, side, allow_price_leaf=allow_price_leaf)
             if extracted is not None:
                 return extracted
 
-        if "price" in payload:
+        if allow_price_leaf and "price" in payload:
             candidate = _coerce_float(payload.get("price"))
             if candidate is not None:
                 decimals = _infer_price_decimals(payload.get("price"))
                 return PriceSample(float(candidate), decimals)
+
         return None
 
     if isinstance(payload, Iterable) and not isinstance(payload, (str, bytes, bytearray)):
         for item in payload:
-            extracted = _extract_best_price(item, side)
+            extracted = _extract_best_price(
+                item, side, allow_price_leaf=allow_price_leaf
+            )
             if extracted is not None:
                 return extracted
         return None
 
-    numeric = _coerce_float(payload)
-    if numeric is not None:
-        decimals = _infer_price_decimals(payload)
-        return PriceSample(float(numeric), decimals)
+    if allow_price_leaf:
+        numeric = _coerce_float(payload)
+        if numeric is not None:
+            decimals = _infer_price_decimals(payload)
+            return PriceSample(float(numeric), decimals)
 
     return None
 
@@ -343,13 +347,6 @@ def _fetch_best_price(client: Any, token_id: str, side: str) -> Optional[PriceSa
         ("get_order_book", {"market": token_id}, False),
         ("get_orderbook", {"token_id": token_id}, True),
         ("get_orderbook", {"market": token_id}, False),
-        ("get_market", {"market": token_id}, False),
-        ("get_market", {"token_id": token_id}, False),
-        ("get_market_data", {"market": token_id}, False),
-        ("get_market_data", {"token_id": token_id}, False),
-        ("get_ticker", {"market": token_id}, False),
-        ("get_ticker", {"token_id": token_id}, False),
-        ("get_price", {"token_id": token_id, "side": "SELL" if side == "bid" else "BUY"}, False),
     )
 
     for name, kwargs, allow_positional in method_candidates:
