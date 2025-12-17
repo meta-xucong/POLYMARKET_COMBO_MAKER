@@ -227,12 +227,6 @@ def _extract_best_price(payload: Any, side: str) -> Optional[PriceSample]:
         if _is_directionally_incompatible(payload, side):
             return None
 
-        if "price" in payload:
-            candidate = _coerce_float(payload.get("price"))
-            if candidate is not None:
-                decimals = _infer_price_decimals(payload.get("price"))
-                return PriceSample(float(candidate), decimals)
-
         primary_keys = {
             "bid": (
                 "best_bid",
@@ -317,6 +311,12 @@ def _extract_best_price(payload: Any, side: str) -> Optional[PriceSample]:
             extracted = _extract_best_price(value, side)
             if extracted is not None:
                 return extracted
+
+        if "price" in payload:
+            candidate = _coerce_float(payload.get("price"))
+            if candidate is not None:
+                decimals = _infer_price_decimals(payload.get("price"))
+                return PriceSample(float(candidate), decimals)
         return None
 
     if isinstance(payload, Iterable) and not isinstance(payload, (str, bytes, bytearray)):
@@ -529,6 +529,7 @@ def maker_buy_follow_bid(
     min_quote_amt: float = 1.0,
     min_order_size: float = DEFAULT_MIN_ORDER_SIZE,
     best_bid_fn: Optional[Callable[[], Optional[float]]] = None,
+    best_ask_fn: Optional[Callable[[], Optional[float]]] = None,
     stop_check: Optional[Callable[[], bool]] = None,
     sleep_fn: Callable[[float], None] = time.sleep,
     progress_probe: Optional[Callable[[], None]] = None,
@@ -777,10 +778,23 @@ def maker_buy_follow_bid(
                 sleep_fn(poll_sec)
                 continue
             _maybe_update_price_dp(bid_info.decimals)
-            px = _round_up_to_dp(bid, price_dp_active)
+            ask_info = _best_price_info(client, token_id, best_ask_fn, "ask")
+            if ask_info is not None:
+                _maybe_update_price_dp(ask_info.decimals)
+            px = _round_down_to_dp(bid, price_dp_active)
             if px <= 0:
                 sleep_fn(poll_sec)
                 continue
+            if ask_info is not None and ask_info.price is not None:
+                ask_val = float(ask_info.price)
+                if ask_val > 0:
+                    max_maker_px = _floor_to_dp(ask_val - tick, price_dp_active)
+                    if max_maker_px <= 0:
+                        sleep_fn(poll_sec)
+                        continue
+                    if px > max_maker_px + 1e-12:
+                        px = max_maker_px
+                        bid = min(bid, px)
             eff_qty = _ceil_to_dp(remaining, size_dp_active)
             if eff_qty <= 0:
                 final_status = "SKIPPED"
