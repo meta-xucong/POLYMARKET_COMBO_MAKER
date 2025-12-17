@@ -519,3 +519,18 @@ def test_best_price_info_filters_placeholder_price():
     # 0.001 是 WS 初始化常见的占位价，应被视为无效并转为 None。
     result = maker._best_price_info(object(), "asset", lambda: 0.001, "bid")
     assert result is None
+
+
+def test_extract_best_price_prefers_orderbook_over_trade_price():
+    payload = {"best_bid": {"price": "0.12"}, "price": "0.5"}
+
+    result = maker._extract_best_price(payload, "bid")
+
+    assert result is not None
+    assert result.price == pytest.approx(0.12)
+
+
+def test_extract_best_price_requires_orderbook_fields():
+    payload = {"price": "0.33", "side": "buy"}
+
+    assert maker._extract_best_price(payload, "bid") is None

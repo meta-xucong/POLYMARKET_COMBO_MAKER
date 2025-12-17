@@ -181,7 +181,7 @@ def _infer_price_decimals(value: Any, *, max_dp: int = 6) -> Optional[int]:
     return min(-int(exponent), max_dp)
 
 
-def _extract_best_price(payload: Any, side: str) -> Optional[PriceSample]:
+def _extract_best_price(payload: Any, side: str, *, allow_price_leaf: bool = False) -> Optional[PriceSample]:
     def _is_directionally_incompatible(obj: Mapping[str, Any], side: str) -> bool:
         """Return True if payload side information conflicts with the target side."""
 
@@ -227,12 +227,6 @@ def _extract_best_price(payload: Any, side: str) -> Optional[PriceSample]:
         if _is_directionally_incompatible(payload, side):
             return None
 
-        if "price" in payload:
-            candidate = _coerce_float(payload.get("price"))
-            if candidate is not None:
-                decimals = _infer_price_decimals(payload.get("price"))
-                return PriceSample(float(candidate), decimals)
-
         primary_keys = {
             "bid": (
                 "best_bid",
@@ -256,7 +250,7 @@ def _extract_best_price(payload: Any, side: str) -> Optional[PriceSample]:
         }[side]
         for key in primary_keys:
             if key in payload:
-                extracted = _extract_best_price(payload[key], side)
+                extracted = _extract_best_price(payload[key], side, allow_price_leaf=True)
                 if extracted is not None:
                     return extracted
 
@@ -276,7 +270,7 @@ def _extract_best_price(payload: Any, side: str) -> Optional[PriceSample]:
                             candidate = _coerce_float(entry.get("price"))
                             if candidate is not None:
                                 return PriceSample(float(candidate), decimals)
-                        extracted = _extract_best_price(entry, side)
+                        extracted = _extract_best_price(entry, side, allow_price_leaf=True)
                         if extracted is not None:
                             return extracted
 
@@ -314,22 +308,32 @@ def _extract_best_price(payload: Any, side: str) -> Optional[PriceSample]:
         for key, value in payload.items():
             if isinstance(key, str) and key.strip().lower() in opposite_keys:
                 continue
-            extracted = _extract_best_price(value, side)
+            extracted = _extract_best_price(value, side, allow_price_leaf=allow_price_leaf)
             if extracted is not None:
                 return extracted
+
+        if allow_price_leaf and "price" in payload:
+            candidate = _coerce_float(payload.get("price"))
+            if candidate is not None:
+                decimals = _infer_price_decimals(payload.get("price"))
+                return PriceSample(float(candidate), decimals)
+
         return None
 
     if isinstance(payload, Iterable) and not isinstance(payload, (str, bytes, bytearray)):
         for item in payload:
-            extracted = _extract_best_price(item, side)
+            extracted = _extract_best_price(
+                item, side, allow_price_leaf=allow_price_leaf
+            )
             if extracted is not None:
                 return extracted
         return None
 
-    numeric = _coerce_float(payload)
-    if numeric is not None:
-        decimals = _infer_price_decimals(payload)
-        return PriceSample(float(numeric), decimals)
+    if allow_price_leaf:
+        numeric = _coerce_float(payload)
+        if numeric is not None:
+            decimals = _infer_price_decimals(payload)
+            return PriceSample(float(numeric), decimals)
 
     return None
 
@@ -343,13 +347,6 @@ def _fetch_best_price(client: Any, token_id: str, side: str) -> Optional[PriceSa
         ("get_order_book", {"market": token_id}, False),
         ("get_orderbook", {"token_id": token_id}, True),
         ("get_orderbook", {"market": token_id}, False),
-        ("get_market", {"market": token_id}, False),
-        ("get_market", {"token_id": token_id}, False),
-        ("get_market_data", {"market": token_id}, False),
-        ("get_market_data", {"token_id": token_id}, False),
-        ("get_ticker", {"market": token_id}, False),
-        ("get_ticker", {"token_id": token_id}, False),
-        ("get_price", {"token_id": token_id, "side": "SELL" if side == "bid" else "BUY"}, False),
     )
 
     for name, kwargs, allow_positional in method_candidates:
@@ -529,6 +526,7 @@ def maker_buy_follow_bid(
     min_quote_amt: float = 1.0,
     min_order_size: float = DEFAULT_MIN_ORDER_SIZE,
     best_bid_fn: Optional[Callable[[], Optional[float]]] = None,
+    best_ask_fn: Optional[Callable[[], Optional[float]]] = None,
     stop_check: Optional[Callable[[], bool]] = None,
     sleep_fn: Callable[[float], None] = time.sleep,
     progress_probe: Optional[Callable[[], None]] = None,
@@ -777,10 +775,23 @@ def maker_buy_follow_bid(
                 sleep_fn(poll_sec)
                 continue
             _maybe_update_price_dp(bid_info.decimals)
-            px = _round_up_to_dp(bid, price_dp_active)
+            ask_info = _best_price_info(client, token_id, best_ask_fn, "ask")
+            if ask_info is not None:
+                _maybe_update_price_dp(ask_info.decimals)
+            px = _round_down_to_dp(bid, price_dp_active)
             if px <= 0:
                 sleep_fn(poll_sec)
                 continue
+            if ask_info is not None and ask_info.price is not None:
+                ask_val = float(ask_info.price)
+                if ask_val > 0:
+                    max_maker_px = _floor_to_dp(ask_val - tick, price_dp_active)
+                    if max_maker_px <= 0:
+                        sleep_fn(poll_sec)
+                        continue
+                    if px > max_maker_px + 1e-12:
+                        px = max_maker_px
+                        bid = min(bid, px)
             eff_qty = _ceil_to_dp(remaining, size_dp_active)
             if eff_qty <= 0:
                 final_status = "SKIPPED"
