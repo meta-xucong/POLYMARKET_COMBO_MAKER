@@ -534,3 +534,52 @@ def test_extract_best_price_requires_orderbook_fields():
     payload = {"price": "0.33", "side": "buy"}
 
     assert maker._extract_best_price(payload, "bid") is None
+
+
+def test_extract_best_price_ignores_price_field_when_bids_present():
+    payload = {
+        "price": 0.0005,
+        "bid": {"price": "0.001"},
+        "bids": [{"price": "0.01"}, {"price": "0.02"}],
+    }
+
+    result = maker._extract_best_price(payload, "bid")
+
+    assert result is not None
+    assert result.price == pytest.approx(0.02)
+    assert result.source == "orderbook"
+
+
+def test_extract_best_price_uses_extreme_of_unsorted_ladder():
+    payload = {"asks": [{"price": 0.15}, {"price": 0.1}, {"price": 0.12}]}
+
+    result = maker._extract_best_price(payload, "ask")
+
+    assert result is not None
+    assert result.price == pytest.approx(0.1)
+
+
+def test_fetch_best_price_skips_placeholder_and_tries_next_method():
+    class DummyClient:
+        def get_market_orderbook(self, market):
+            return {"price": 0.0005}
+
+        def get_order_book(self, token_id):
+            return {"bids": [{"price": "0.02"}]}
+
+    result = maker._fetch_best_price(DummyClient(), "token", "bid")
+
+    assert result is not None
+    assert result.price == pytest.approx(0.02)
+    assert result.source == "orderbook"
+
+
+def test_orderbook_placeholder_value_allowed():
+    class DummyClient:
+        def get_market_orderbook(self, market):
+            return {"bids": [{"price": 0.001}]}
+
+    result = maker._best_price_info(DummyClient(), "asset", lambda: None, "bid")
+
+    assert result is not None
+    assert result.price == pytest.approx(0.001)
