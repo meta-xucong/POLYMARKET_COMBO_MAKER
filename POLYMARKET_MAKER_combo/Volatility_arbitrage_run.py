@@ -86,6 +86,8 @@ GAMMA_ROOT = os.getenv("POLY_GAMMA_ROOT", "https://gamma-api.polymarket.com")
 DATA_API_ROOT = os.getenv("POLY_DATA_API_ROOT", "https://data-api.polymarket.com")
 # 强制最低下单份数满足官方要求（不少于 5）。
 API_MIN_ORDER_SIZE = DEFAULT_MIN_ORDER_SIZE
+# 买一价就绪阈值：仅过滤掉非正数，避免 0.006 / 0.001 等低价被误判为“无效”。
+READY_MIN_PRICE = 0.0
 ORDERBOOK_STALE_AFTER_SEC = 5.0
 POSITION_SYNC_INTERVAL = 60.0
 POST_BUY_POSITION_CHECK_DELAY = 5.0
@@ -1639,7 +1641,7 @@ def main():
                 except Exception as exc:
                     print(f"[WARN] REST 查询买一价失败（{tid}）：{exc}")
                     continue
-                if info is None or info.price is None or info.price <= 0.01:
+                if info is None or info.price is None or info.price <= READY_MIN_PRICE:
                     continue
                 pending.discard(tid)
 
@@ -1732,7 +1734,7 @@ def main():
                 if isinstance(best_bid_fns, Mapping):
                     best_fn = best_bid_fns.get(tid)
                 info = _best_bid_info(client, tid, best_fn)
-                if info is None or info.price is None or info.price <= 0.01:
+                if info is None or info.price is None or info.price <= READY_MIN_PRICE:
                     continue
                 samples[tid] = float(info.price)
                 seen.add(tid)
