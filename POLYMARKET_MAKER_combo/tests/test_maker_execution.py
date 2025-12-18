@@ -620,3 +620,67 @@ def test_orderbook_placeholder_value_allowed():
 
     assert result is not None
     assert result.price == pytest.approx(0.001)
+
+
+def test_best_bid_depth_accumulates_sizes():
+    payload = {
+        "bids": [
+            {"price": "0.12", "size": 1.0},
+            {"price": 0.12, "quantity": 2.5},
+            {"price": 0.11, "size": 5.0},
+        ]
+    }
+
+    depth = maker._extract_best_bid_depth(payload)
+
+    assert depth is not None
+    assert depth.price == pytest.approx(0.12)
+    assert depth.total_size == pytest.approx(3.5)
+
+
+def test_maker_buy_requotes_when_solo_on_best_bid():
+    class DepthAwareClient(DummyClient):
+        def __init__(self):
+            super().__init__(
+                [
+                    [
+                        {"status": "OPEN", "filledAmount": 0.0},
+                        {"status": "OPEN", "filledAmount": 0.0},
+                    ],
+                    [
+                        {"status": "FILLED", "filledAmount": 2.0, "avgPrice": 0.48},
+                    ],
+                ]
+            )
+            self.orderbooks = collections.deque(
+                [
+                    {"bids": [{"price": 0.50, "size": 2.0}]},
+                    {"bids": [{"price": 0.50, "size": 2.0}]},
+                    {"bids": [{"price": 0.48, "size": 3.0}]},
+                ]
+            )
+
+        def get_market_orderbook(self, market):
+            if not self.orderbooks:
+                return {"bids": []}
+            if len(self.orderbooks) == 1:
+                return self.orderbooks[0]
+            return self.orderbooks.popleft()
+
+    client = DepthAwareClient()
+
+    result = maker.maker_buy_follow_bid(
+        client,
+        token_id="asset",
+        target_size=2.0,
+        poll_sec=0.0,
+        min_order_size=0.0,
+        best_bid_fn=None,
+        sleep_fn=lambda _: None,
+        rebid_when_solo=True,
+    )
+
+    assert result["filled"] == pytest.approx(2.0)
+    assert len(client.created_orders) == 2
+    assert client.cancelled, "Expected solo bid protection to trigger cancellation"
+    assert client.created_orders[-1]["price"] == pytest.approx(0.48)
