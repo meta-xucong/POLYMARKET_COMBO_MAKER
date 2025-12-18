@@ -1310,9 +1310,6 @@ def maker_multi_buy_follow_bid(
 
     entries = [(entry, *_parse_market_entry(entry)) for entry in submarkets]
 
-    warmup_missing: List[str] = []
-    warmup_timeout_hit = False
-
     if preload_best_bids:
         pending: Dict[str, Optional[Callable[[], Optional[float]]]] = {}
         for entry, mid, _ in entries:
@@ -1331,6 +1328,7 @@ def maker_multi_buy_follow_bid(
             heartbeat_interval = 10.0
             last_heartbeat = start
             pending_ids = set(pending.keys())
+            warned_timeout = False
             while pending:
                 for mid, fn in list(pending.items()):
                     info = _best_price_info(client, mid, fn, "bid")
@@ -1340,16 +1338,14 @@ def maker_multi_buy_follow_bid(
                 if not pending:
                     break
                 now = time.time()
-                if now - start >= price_warmup_timeout:
+                if now - start >= price_warmup_timeout and not warned_timeout:
                     waiting = sorted(pending.keys())
-                    warmup_missing = waiting
-                    warmup_timeout_hit = True
+                    warned_timeout = True
                     print(
-                        "[WARN] 报价预热已等待约 {:.0f}s，仍未获取：{}；将继续执行并在缺价处尝试即时补价。".format(
+                        "[WARN] 报价预热已等待约 {:.0f}s，仍未获取：{}；将持续等待直至全部就绪。".format(
                             now - start, ", ".join(waiting) or "无"
                         )
                     )
-                    break
                 if now - last_heartbeat >= heartbeat_interval:
                     obtained = sorted(set(shared_active_prices.keys()) & pending_ids)
                     waiting = sorted(pending.keys())
@@ -1360,15 +1356,6 @@ def maker_multi_buy_follow_bid(
                     )
                     last_heartbeat = now
                 time.sleep(poll_interval)
-
-    if warmup_timeout_hit and warmup_missing:
-        summary["_meta"] = {
-            "states": ["NO_PRICE", "PRICE_WARMUP_TIMEOUT"],
-            "balance_ok": True,
-            "missing_quotes": warmup_missing,
-            "price_sum_threshold": price_sum_threshold,
-        }
-        return summary
 
     threads: List[threading.Thread] = []
     for entry, mid, label in entries:
