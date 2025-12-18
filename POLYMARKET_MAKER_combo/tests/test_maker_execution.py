@@ -1,6 +1,6 @@
 import collections
 import time
-from typing import Deque, Dict, List
+from typing import Deque, Dict, List, Optional
 
 import pytest
 
@@ -496,17 +496,34 @@ def test_multi_buy_runs_for_each_submarket(monkeypatch):
     assert "FILLED" in (results.get("_meta", {}).get("states") or [])
 
 
-def test_multi_buy_waits_for_price_warmup(monkeypatch):
+def test_multi_buy_waits_for_all_prices(monkeypatch):
     calls: List[str] = []
 
-    def _fake_buy(*args, **kwargs):
-        calls.append("called")
+    def _fake_buy(client, token_id: str, **kwargs):
+        calls.append(token_id)
         return {"status": "FILLED"}
 
     monkeypatch.setattr(maker, "maker_buy_follow_bid", _fake_buy)
     monkeypatch.setattr(time, "sleep", lambda _: None)
 
-    best_bid_fns = {"aaa": lambda: None, "bbb": lambda: None}
+    def _iterating_price(prices: List[Optional[float]]):
+        iterator = iter(prices)
+        last = prices[-1] if prices else None
+
+        def _fn():
+            nonlocal last
+            try:
+                last = next(iterator)
+            except StopIteration:
+                return last
+            return last
+
+        return _fn
+
+    best_bid_fns = {
+        "aaa": _iterating_price([None, None, 0.12]),
+        "bbb": _iterating_price([None, 0.34]),
+    }
 
     results = maker.maker_multi_buy_follow_bid(
         object(),
@@ -517,16 +534,16 @@ def test_multi_buy_waits_for_price_warmup(monkeypatch):
         price_warmup_poll=0.0,
     )
 
-    assert calls == []
+    assert set(calls) == {"aaa", "bbb"}
     assert results.get("_meta", {}).get("balance_ok") is True
-    assert "NO_PRICE" in (results.get("_meta", {}).get("states") or [])
-    assert "PRICE_WARMUP_TIMEOUT" in (results.get("_meta", {}).get("states") or [])
 
 
-def test_best_price_info_filters_placeholder_price():
-    # 0.001 是 WS 初始化常见的占位价，应被视为无效并转为 None。
+def test_best_price_info_allows_minimum_bid_from_callback():
+    # 0.001 应视为有效买一价，不应被过滤掉。
     result = maker._best_price_info(object(), "asset", lambda: 0.001, "bid")
-    assert result is None
+
+    assert result is not None
+    assert result.price == pytest.approx(0.001)
 
 
 def test_extract_best_price_prefers_orderbook_over_trade_price():
@@ -580,6 +597,18 @@ def test_fetch_best_price_skips_placeholder_and_tries_next_method():
     assert result is not None
     assert result.price == pytest.approx(0.02)
     assert result.source == "orderbook"
+
+
+def test_best_price_info_fallbacks_to_rest_when_callback_invalid():
+    class DummyClient:
+        def get_market_orderbook(self, market):
+            return {"bids": [{"price": 0.021}]}
+
+    # 回调返回非正数会被过滤，应继续使用 REST 报价。
+    result = maker._best_price_info(DummyClient(), "asset", lambda: 0.0, "bid")
+
+    assert result is not None
+    assert result.price == pytest.approx(0.021)
 
 
 def test_orderbook_placeholder_value_allowed():

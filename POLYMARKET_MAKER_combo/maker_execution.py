@@ -430,8 +430,9 @@ def _best_price_info(
         except (TypeError, ValueError):
             return None
 
-        # WS 初始占位价常为 0.001，属于明显无效值，需过滤为 None 以防误用。
-        if sample.source != "orderbook" and price_val <= 0.001 + 1e-12:
+        # 允许 0.001 这类极低价参与“已就绪”判定（来源可能是 WS 占位价），
+        # 仅过滤掉非正数即可。
+        if sample.source != "orderbook" and price_val <= 0.0:
             return None
         return PriceSample(price_val, sample.decimals, sample.source)
 
@@ -441,9 +442,11 @@ def _best_price_info(
         except Exception:
             val = None
         if val is not None and val > 0:
-            return _normalize(
+            normalized = _normalize(
                 PriceSample(float(val), _infer_price_decimals(val), source="callback")
             )
+            if normalized is not None:
+                return normalized
 
     return _normalize(_fetch_best_price(client, token_id, side))
 
@@ -1310,9 +1313,6 @@ def maker_multi_buy_follow_bid(
 
     entries = [(entry, *_parse_market_entry(entry)) for entry in submarkets]
 
-    warmup_missing: List[str] = []
-    warmup_timeout_hit = False
-
     if preload_best_bids:
         pending: Dict[str, Optional[Callable[[], Optional[float]]]] = {}
         for entry, mid, _ in entries:
@@ -1331,6 +1331,7 @@ def maker_multi_buy_follow_bid(
             heartbeat_interval = 10.0
             last_heartbeat = start
             pending_ids = set(pending.keys())
+            warned_timeout = False
             while pending:
                 for mid, fn in list(pending.items()):
                     info = _best_price_info(client, mid, fn, "bid")
@@ -1340,16 +1341,14 @@ def maker_multi_buy_follow_bid(
                 if not pending:
                     break
                 now = time.time()
-                if now - start >= price_warmup_timeout:
+                if now - start >= price_warmup_timeout and not warned_timeout:
                     waiting = sorted(pending.keys())
-                    warmup_missing = waiting
-                    warmup_timeout_hit = True
+                    warned_timeout = True
                     print(
-                        "[WARN] 报价预热已等待约 {:.0f}s，仍未获取：{}；将继续执行并在缺价处尝试即时补价。".format(
+                        "[WARN] 报价预热已等待约 {:.0f}s，仍未获取：{}；将持续等待直至全部就绪。".format(
                             now - start, ", ".join(waiting) or "无"
                         )
                     )
-                    break
                 if now - last_heartbeat >= heartbeat_interval:
                     obtained = sorted(set(shared_active_prices.keys()) & pending_ids)
                     waiting = sorted(pending.keys())
@@ -1360,15 +1359,6 @@ def maker_multi_buy_follow_bid(
                     )
                     last_heartbeat = now
                 time.sleep(poll_interval)
-
-    if warmup_timeout_hit and warmup_missing:
-        summary["_meta"] = {
-            "states": ["NO_PRICE", "PRICE_WARMUP_TIMEOUT"],
-            "balance_ok": True,
-            "missing_quotes": warmup_missing,
-            "price_sum_threshold": price_sum_threshold,
-        }
-        return summary
 
     threads: List[threading.Thread] = []
     for entry, mid, label in entries:
