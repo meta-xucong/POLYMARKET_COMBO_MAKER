@@ -1628,14 +1628,35 @@ def main():
         )
         for entry in chosen_tokens
     }
+    def _wait_all_bids_via_rest(token_ids: List[str], interval: float = 1.0) -> None:
+        pending = {tid for tid in token_ids if tid}
+        attempt = 0
+        while pending:
+            attempt += 1
+            for tid in list(pending):
+                try:
+                    info = _best_bid_info(client, tid, None)
+                except Exception as exc:
+                    print(f"[WARN] REST 查询买一价失败（{tid}）：{exc}")
+                    continue
+                if info is None or info.price is None or info.price <= 0.01:
+                    continue
+                pending.discard(tid)
+
+            if not pending:
+                break
+
+            names = [token_display_names.get(tid, tid) for tid in sorted(pending)]
+            print(
+                f"[WAIT] 正在等待所有子问题买一价就绪（第 {attempt} 轮）：",
+                ", ".join(names),
+            )
+            time.sleep(interval)
+
     if ws_watch_by_ids is not None and WsBestBidTracker is not None:
         tracker = WsBestBidTracker(token_id_list, client)
         if tracker.start():
             print("[INFO] 已启动 WS 行情订阅，优先使用实时买一价，等待首批报价…")
-            wait_attempt = 0
-            max_wait_rounds = 3  # 兜底：最多等待 3 个周期后继续执行，避免卡死在份数输入前。
-            max_wait_seconds = 20.0  # 二次兜底：总等待时间上限，避免 WS 异常导致长时间无法输入份数。
-            wait_started_at = time.time()
             while True:
                 missing_bids = tracker.wait_for_first_bids(timeout=10.0, poll=0.5)
                 if not missing_bids:
@@ -1643,25 +1664,18 @@ def main():
                     break
 
                 names = [token_display_names.get(tid, tid) for tid in sorted(missing_bids)]
-                wait_attempt += 1
                 if tracker.error:
                     print(
-                        "[WARN] WS 行情订阅遇到异常，已切换为 REST 报价：",
+                        "[WARN] WS 行情订阅遇到异常，已启用 REST 补价等待：",
                         tracker.error,
                     )
-                    break
-                if wait_attempt >= max_wait_rounds:
-                    print(
-                        "[WARN] 部分子问题的首条买一价长期未就绪：",
-                        ", ".join(names),
-                        "；将继续执行并在缺价处退回 REST 报价。",
-                    )
-                    break
-                if time.time() - wait_started_at >= max_wait_seconds:
-                    print(
-                        "[WARN] WS 行情等待超过时限（约 20s），继续执行并退回 REST 报价。"
-                    )
-                    break
+
+                # 主动触发一次 REST 补价，避免 WS 长时间缺价时无法解锁首价。
+                try:
+                    tracker._refresh_best_via_rest(announce=True)  # type: ignore[attr-defined]
+                except Exception as exc:
+                    print(f"[WARN] REST 补价触发失败：{exc}")
+
                 print(
                     "[INFO] 首条买一价仍在等待，尚未就绪的子问题：",
                     ", ".join(names),
@@ -1677,6 +1691,9 @@ def main():
     else:
         suffix = f"（原因：{_ws_import_error}）" if '_ws_import_error' in globals() and _ws_import_error else ""
         print(f"[WARN] WS 行情模块不可用，继续尝试 REST 报价。{suffix}")
+
+    if tracker is None:
+        _wait_all_bids_via_rest(token_id_list)
 
     print("请输入本次每个子问题的下单份数（留空则默认按 5 份执行）：")
     size_raw = input().strip()
