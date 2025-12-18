@@ -538,10 +538,12 @@ def test_multi_buy_waits_for_all_prices(monkeypatch):
     assert results.get("_meta", {}).get("balance_ok") is True
 
 
-def test_best_price_info_filters_placeholder_price():
-    # 0.001 是 WS 初始化常见的占位价，应被视为无效并转为 None。
+def test_best_price_info_allows_minimum_bid_from_callback():
+    # 0.001 应视为有效买一价，不应被过滤掉。
     result = maker._best_price_info(object(), "asset", lambda: 0.001, "bid")
-    assert result is None
+
+    assert result is not None
+    assert result.price == pytest.approx(0.001)
 
 
 def test_extract_best_price_prefers_orderbook_over_trade_price():
@@ -595,6 +597,18 @@ def test_fetch_best_price_skips_placeholder_and_tries_next_method():
     assert result is not None
     assert result.price == pytest.approx(0.02)
     assert result.source == "orderbook"
+
+
+def test_best_price_info_fallbacks_to_rest_when_callback_invalid():
+    class DummyClient:
+        def get_market_orderbook(self, market):
+            return {"bids": [{"price": 0.021}]}
+
+    # 回调返回非正数会被过滤，应继续使用 REST 报价。
+    result = maker._best_price_info(DummyClient(), "asset", lambda: 0.0, "bid")
+
+    assert result is not None
+    assert result.price == pytest.approx(0.021)
 
 
 def test_orderbook_placeholder_value_allowed():

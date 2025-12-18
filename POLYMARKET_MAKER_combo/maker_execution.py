@@ -430,8 +430,9 @@ def _best_price_info(
         except (TypeError, ValueError):
             return None
 
-        # WS 初始占位价常为 0.001，属于明显无效值，需过滤为 None 以防误用。
-        if sample.source != "orderbook" and price_val <= 0.001 + 1e-12:
+        # 允许 0.001 这类极低价参与“已就绪”判定（来源可能是 WS 占位价），
+        # 仅过滤掉非正数即可。
+        if sample.source != "orderbook" and price_val <= 0.0:
             return None
         return PriceSample(price_val, sample.decimals, sample.source)
 
@@ -441,9 +442,11 @@ def _best_price_info(
         except Exception:
             val = None
         if val is not None and val > 0:
-            return _normalize(
+            normalized = _normalize(
                 PriceSample(float(val), _infer_price_decimals(val), source="callback")
             )
+            if normalized is not None:
+                return normalized
 
     return _normalize(_fetch_best_price(client, token_id, side))
 
