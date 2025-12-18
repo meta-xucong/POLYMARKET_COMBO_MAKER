@@ -141,20 +141,15 @@ def test_maker_buy_reprices_on_bid_rise():
     assert first_order["price"] == pytest.approx(0.50, rel=0, abs=1e-9)
 
 
-def test_maker_buy_skips_reprice_when_sum_cap_hit():
+def test_maker_buy_pauses_until_price_sum_drops():
     shared_prices: Dict[str, float] = {"other": 0.6}
     guard = maker.PriceSumArbitrageGuard()
     guard.commit_price("other", 0.6)
     client = DummyClient(
-        status_sequences=[
-            [
-                {"status": "OPEN", "filledAmount": 0.0},
-                {"status": "FILLED", "filledAmount": 1.0, "avgPrice": 0.55},
-            ],
-        ]
+        status_sequences=[[{"status": "FILLED", "filledAmount": 1.0, "avgPrice": 0.3}]]
     )
 
-    bids = _stream([0.5, 0.55, 0.55])
+    bids = _stream([0.5, 0.55, 0.3])
 
     result = maker.maker_buy_follow_bid(
         client,
@@ -166,14 +161,12 @@ def test_maker_buy_skips_reprice_when_sum_cap_hit():
         best_bid_fn=bids,
         sleep_fn=lambda _: None,
         shared_active_prices=shared_prices,
-        price_update_guard=lambda price_map: sum(price_map.values()) < 1.0,
         price_sum_guard=guard,
     )
 
-    assert result["status"] == "STOPPED"
-    assert result["filled"] == pytest.approx(0.0)
-    assert shared_prices.get("asset") is None
-    assert not client.created_orders
+    assert result["status"] == "FILLED"
+    assert result["filled"] == pytest.approx(1.0)
+    assert client.created_orders[0]["price"] == pytest.approx(0.3, rel=0, abs=1e-9)
 
 
 def test_maker_buy_stops_when_sum_cap_blocked_before_post():
@@ -181,6 +174,12 @@ def test_maker_buy_stops_when_sum_cap_blocked_before_post():
     guard = maker.PriceSumArbitrageGuard()
     guard.commit_price("other", 0.6)
     client = DummyClient(status_sequences=[[{"status": "OPEN", "filledAmount": 0.0}]])
+
+    stop_counter = {"count": 0}
+
+    def _stop_after_a_few_loops() -> bool:
+        stop_counter["count"] += 1
+        return stop_counter["count"] > 5
 
     bids = _stream([0.45, 0.45])
 
@@ -195,19 +194,25 @@ def test_maker_buy_stops_when_sum_cap_blocked_before_post():
         sleep_fn=lambda _: None,
         shared_active_prices=shared_prices,
         price_sum_guard=guard,
+        stop_check=_stop_after_a_few_loops,
     )
 
     assert result["status"] == "STOPPED"
     assert not client.created_orders
+    assert guard.last_violation_total() == pytest.approx(1.05)
 
 
 def test_price_guard_uses_99pct_cap():
     guard = maker.PriceSumArbitrageGuard()
 
     assert guard.threshold == pytest.approx(0.99)
+    assert guard.resume_threshold == pytest.approx(0.98)
     assert guard.validate_proposed_prices({"a": 0.5, "b": 0.48}) is True
     assert guard.validate_proposed_prices({"a": 0.5, "b": 0.5}) is False
-    assert guard.should_stop() is True
+    assert guard.should_pause() is True
+
+    assert guard.validate_proposed_prices({"a": 0.5, "b": 0.47}) is True
+    assert guard.should_pause() is False
 
 
 def test_price_guard_includes_fills_in_sum():
@@ -217,8 +222,11 @@ def test_price_guard_includes_fills_in_sum():
 
     # 新的挂单拟以 0.4 挂出，加上 0.62 应触发阈值
     assert guard.validate_proposed_prices({"active": 0.4}) is False
-    assert guard.should_stop()
+    assert guard.should_pause()
     assert guard.violation_total() == pytest.approx(1.02)
+
+    assert guard.validate_proposed_prices({"active": 0.35}) is True
+    assert guard.should_pause() is False
 
 
 def test_maker_buy_handles_missing_fill_amount_on_match():

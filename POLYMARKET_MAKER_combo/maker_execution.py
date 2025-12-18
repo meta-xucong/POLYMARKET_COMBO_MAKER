@@ -49,29 +49,47 @@ DEFAULT_MIN_ORDER_SIZE = 5.0
 
 
 class PriceSumArbitrageGuard:
-    """Track working maker prices and stop when the sum crosses the cap.
+    """Track working maker prices and pause when the sum crosses the cap.
 
     该守卫用于跨市场的套利校验：如果所有挂单价格之和达到或超过设定阈值
-    （默认 0.99），则触发停止信号，供上层统一撤单或转入卖出流程。
+    （默认 0.99），则触发暂停信号；当价格之和重新回落到恢复阈值（默认
+    0.98）以下时，自动解除暂停，让上层继续挂单。
     """
 
-    def __init__(self, *, threshold: float = 0.99) -> None:
+    def __init__(self, *, threshold: float = 0.99, resume_threshold: Optional[float] = 0.98) -> None:
         self.threshold = float(threshold)
+        self.resume_threshold = float(resume_threshold if resume_threshold is not None else threshold)
         self._lock = threading.Lock()
-        self._stop_event = threading.Event()
+        self._pause_event = threading.Event()
         self._violation_total: Optional[float] = None
+        self._last_violation_total: Optional[float] = None
         self.prices: Dict[str, float] = {}
         self.fills: Dict[str, Dict[str, float]] = {}
 
-    def _mark_violation(self, total: float) -> None:
-        self._violation_total = total
-        self._stop_event.set()
+    def _evaluate_total(self, total: float) -> bool:
+        if total >= self.threshold - 1e-12:
+            self._violation_total = total
+            self._last_violation_total = total
+            self._pause_event.set()
+            return False
+
+        if self._pause_event.is_set() and total <= self.resume_threshold + 1e-12:
+            self._violation_total = None
+            self._pause_event.clear()
+
+        return not self._pause_event.is_set()
+
+    def should_pause(self) -> bool:
+        return self._pause_event.is_set()
 
     def should_stop(self) -> bool:
-        return self._stop_event.is_set()
+        return self.should_pause()
 
     def violation_total(self) -> Optional[float]:
         return self._violation_total
+
+    def last_violation_total(self) -> Optional[float]:
+        return self._last_violation_total
 
     def record_fill(self, token_id: str, filled_size: float, avg_price: Optional[float]) -> None:
         with self._lock:
@@ -83,6 +101,12 @@ class PriceSumArbitrageGuard:
     def clear_price(self, token_id: str) -> None:
         with self._lock:
             self.prices.pop(token_id, None)
+            total = sum(self.prices.values())
+            for tid, fill in self.fills.items():
+                if tid in self.prices:
+                    continue
+                total += float(fill.get("avg_price", 0.0))
+            self._evaluate_total(total)
 
     def validate_proposed_prices(self, proposed: Mapping[str, float]) -> bool:
         with self._lock:
@@ -92,10 +116,7 @@ class PriceSumArbitrageGuard:
                 if tid in proposed:
                     continue
                 total += float(fill.get("avg_price", 0.0))
-            if total >= self.threshold - 1e-12:
-                self._mark_violation(total)
-                return False
-            return True
+            return self._evaluate_total(total)
 
     def commit_price(self, token_id: str, price: float) -> bool:
         with self._lock:
@@ -106,10 +127,7 @@ class PriceSumArbitrageGuard:
                 if tid in self.prices:
                     continue
                 total += float(fill.get("avg_price", 0.0))
-            if total >= self.threshold - 1e-12:
-                self._mark_violation(total)
-                return False
-            return True
+            return self._evaluate_total(total)
 
 
 
@@ -605,9 +623,10 @@ def maker_buy_follow_bid(
         return max(goal_size - filled_total, 0.0)
 
     def _should_stop() -> bool:
-        if price_sum_guard and price_sum_guard.should_stop():
-            return True
         return bool(stop_check and stop_check())
+
+    def _should_pause() -> bool:
+        return bool(price_sum_guard and price_sum_guard.should_pause())
 
     def _emit_state(status_text: Optional[str] = None) -> None:
         if state_callback is None:
@@ -737,7 +756,8 @@ def maker_buy_follow_bid(
         final_status = "FILLED_TRUNCATED" if filled_total > _MIN_FILL_EPS else "SKIPPED_TOO_SMALL"
         return True
 
-    def _validate_price_cap(price_to_set: Optional[float]) -> bool:
+    def _validate_price_cap(price_to_set: Optional[float]) -> Tuple[bool, bool]:
+        paused_by_guard = False
         proposed: Dict[str, float] = {}
         if shared_active_prices is not None:
             proposed.update(shared_active_prices)
@@ -746,10 +766,14 @@ def maker_buy_follow_bid(
         else:
             proposed[token_id] = float(price_to_set)
         if price_sum_guard and not price_sum_guard.validate_proposed_prices(proposed):
-            return False
+            paused_by_guard = price_sum_guard.should_pause()
+            if paused_by_guard and shared_active_prices is not None and price_to_set is not None:
+                shared_active_prices[token_id] = float(price_to_set)
         if price_update_guard and not price_update_guard(proposed):
-            return False
-        return True
+            return False, paused_by_guard
+        if price_sum_guard and paused_by_guard:
+            return False, True
+        return True, False
 
     while True:
         if state_callback and next_probe_at <= 0:
@@ -763,6 +787,17 @@ def maker_buy_follow_bid(
                     rec["status"] = "CANCELLED"
             final_status = "STOPPED"
             break
+
+        if _should_pause():
+            if active_order:
+                _cancel_order(client, active_order)
+                rec = records.get(active_order)
+                if rec is not None:
+                    rec["status"] = "CANCELLED"
+                active_order = None
+                active_price = None
+            if state_callback:
+                _emit_state("PAUSED")
 
         if active_order is None:
             bid_info = _best_bid_info(client, token_id, best_bid_fn)
@@ -812,10 +847,18 @@ def maker_buy_follow_bid(
             if eff_qty <= 0:
                 final_status = "SKIPPED"
                 break
-            if not _validate_price_cap(px):
+            validated, blocked_by_guard = _validate_price_cap(px)
+            if not validated:
+                if blocked_by_guard:
+                    if state_callback:
+                        _emit_state("PAUSED")
+                    if price_sum_guard is not None:
+                        price_sum_guard.commit_price(token_id, float(px))
+                    sleep_fn(poll_sec)
+                    continue
                 final_status = "STOPPED"
                 if price_sum_guard is not None:
-                    price_sum_guard.commit_price(token_id, px)
+                    price_sum_guard.commit_price(token_id, float(px))
                 break
             payload = {
                 "tokenId": token_id,
@@ -1172,8 +1215,6 @@ def maker_multi_buy_follow_bid(
 
     def _wrap_stop_check(user_stop: Optional[Callable[[], bool]]) -> Callable[[], bool]:
         def _combined() -> bool:
-            if price_guard.should_stop():
-                return True
             return bool(user_stop and user_stop())
 
         return _combined
@@ -1342,7 +1383,7 @@ def maker_multi_buy_follow_bid(
         if isinstance(res, Mapping) and "status" in res:
             states.append(str(res.get("status")))
 
-    violation_total = price_guard.violation_total()
+    violation_total = price_guard.last_violation_total()
     meta_payload: Dict[str, Any] = {
         "states": states,
         "balance_ok": True,
@@ -1350,15 +1391,7 @@ def maker_multi_buy_follow_bid(
     }
     if violation_total is not None:
         meta_payload["price_sum_total"] = violation_total
-
-    if price_guard.should_stop() and violation_total is not None:
         meta_payload["price_sum_violation"] = True
-        summary["_meta"] = meta_payload
-        raise SystemExit(
-            "price sum {:.4f} >= threshold {:.4f}, maker buying stopped".format(
-                violation_total, price_guard.threshold
-            )
-        )
 
     summary["_meta"] = meta_payload
 
