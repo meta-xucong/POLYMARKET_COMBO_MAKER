@@ -653,7 +653,10 @@ def maker_buy_follow_bid(
         nonlocal price_dp_active, size_dp_active, tick
         if observed is None:
             return
-        desired = max(base_price_dp, int(observed))
+        # 保持当前精度的单调递增：观察到的精度只能提升，不能降低。
+        # 当盘口价格末尾出现 0（例如 0.980）时，原本通过 normalize 推断的小数位可能变少。
+        # 如果允许回退，会导致 tick 变大，误判“买一未上行”。
+        desired = max(price_dp_active, base_price_dp, int(observed))
         if desired != price_dp_active:
             price_dp_active = desired
             size_dp_active = min(price_dp_active, BUY_SIZE_DP)
