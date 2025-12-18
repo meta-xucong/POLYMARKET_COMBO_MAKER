@@ -34,6 +34,8 @@ CHANNEL = "market"
 # 与 maker_execution._best_price_info 的校验阈值保持一致，避免把 0.001 这类有效价
 # 当成占位值过滤掉，导致首价迟迟无法解锁。
 MIN_VALID_BID = 0.001
+# 就绪阈值独立于占位过滤：只要价格大于 0 即视为已就绪，避免 0.001 恰好被挡掉。
+READY_MIN_PRICE = 0.0
 
 def _now() -> str:
     from datetime import datetime
@@ -94,7 +96,7 @@ def ws_watch_by_ids(asset_ids: List[str],
                 if sample is not None and getattr(sample, "price", None):
                     price_val = float(sample.price)
                     # 忽略明显占位的低价（如 0.000x），以免误判为首条有效买一价。
-                    if price_val > MIN_VALID_BID:
+                    if price_val >= MIN_VALID_BID:
                         return price_val
             except Exception:
                 pass
@@ -103,7 +105,7 @@ def ws_watch_by_ids(asset_ids: List[str],
             if key in payload:
                     try:
                         val = float(payload.get(key))
-                        if val > MIN_VALID_BID:
+                        if val >= MIN_VALID_BID:
                             return val
                     except Exception:
                         continue
@@ -114,7 +116,7 @@ def ws_watch_by_ids(asset_ids: List[str],
                 if isinstance(entry, dict) and "price" in entry:
                     try:
                         val = float(entry.get("price"))
-                        if val > MIN_VALID_BID:
+                        if val >= MIN_VALID_BID:
                             return val
                     except Exception:
                         continue
@@ -290,7 +292,10 @@ class WsBestBidTracker:
     def _has_all_prices_unlocked(self) -> bool:
         if self._first_bid_events:
             return all(evt.is_set() for evt in self._first_bid_events.values())
-        return all((tid in self._best) and (self._best.get(tid, 0.0) > 0) for tid in self.token_ids)
+        return all(
+            (tid in self._best) and (self._best.get(tid, 0.0) > READY_MIN_PRICE)
+            for tid in self.token_ids
+        )
 
     def _extract_token_id(self, payload: Dict[str, Any]) -> Optional[str]:
         if not isinstance(payload, dict):
@@ -329,7 +334,7 @@ class WsBestBidTracker:
                         price_val = float(sample.price)
                     except Exception:
                         continue
-                    if price_val <= MIN_VALID_BID:
+                    if price_val < MIN_VALID_BID:
                         continue
                     with self._lock:
                         prev = self._best.get(token_id)
@@ -358,7 +363,7 @@ class WsBestBidTracker:
         self._last_ws_message_at = time.time()
         with self._lock:
             price_val = float(sample.price)
-            if price_val <= MIN_VALID_BID:
+            if price_val < MIN_VALID_BID:
                 return
             self._best[token_id] = price_val
             evt = self._first_bid_events.get(token_id)
@@ -385,7 +390,7 @@ class WsBestBidTracker:
                 if announce:
                     print(f"[WARN] REST 补价失败（{tid}）：{exc}")
                 continue
-            if info is None or info.price is None or info.price <= MIN_VALID_BID:
+            if info is None or info.price is None or info.price < MIN_VALID_BID:
                 if announce:
                     print(f"[WARN] REST 未返回有效买一价（{tid}）")
                 continue

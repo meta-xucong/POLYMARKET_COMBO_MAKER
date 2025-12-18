@@ -374,6 +374,7 @@ def _fetch_best_price(client: Any, token_id: str, side: str) -> Optional[PriceSa
         ("get_orderbook", {"market": token_id}, False),
     )
 
+    last_exc: Optional[Exception] = None
     for name, kwargs, allow_positional in method_candidates:
         fn = getattr(client, name, None)
         if not callable(fn):
@@ -388,7 +389,8 @@ def _fetch_best_price(client: Any, token_id: str, side: str) -> Optional[PriceSa
                     continue
             else:
                 continue
-        except Exception:
+        except Exception as exc:
+            last_exc = exc
             continue
 
         payload = resp
@@ -407,6 +409,8 @@ def _fetch_best_price(client: Any, token_id: str, side: str) -> Optional[PriceSa
         if price_val <= 0:
             continue
         return PriceSample(price_val, best.decimals, best.source)
+    if last_exc is not None:
+        print(f"[WARN] 获取 {side} 价过程中出现异常（token_id={token_id}）：{last_exc}")
     return None
 
 
