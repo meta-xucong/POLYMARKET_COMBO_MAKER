@@ -173,6 +173,12 @@ class PriceSample(NamedTuple):
     source: str = "unknown"
 
 
+class DepthSample(NamedTuple):
+    price: float
+    total_size: Optional[float]
+    decimals: Optional[int]
+
+
 def _infer_price_decimals(value: Any, *, max_dp: int = 6) -> Optional[int]:
     candidate: Optional[Decimal] = None
     if isinstance(value, str):
@@ -466,6 +472,135 @@ def _best_bid_info(
     return _best_price_info(client, token_id, best_bid_fn, "bid")
 
 
+def _extract_price_and_size(payload: Any) -> Tuple[Optional[float], Optional[float], Optional[int]]:
+    price = None
+    size = None
+    decimals = None
+
+    if isinstance(payload, Mapping):
+        price = _coerce_float(
+            payload.get("price")
+            or payload.get("p")
+            or payload.get("px")
+            or payload.get("bid")
+        )
+        decimals = _infer_price_decimals(payload.get("price"))
+        for key in ("size", "quantity", "qty", "amount", "remaining", "sizeRemaining"):
+            if key in payload:
+                size = _coerce_float(payload.get(key))
+                break
+    elif isinstance(payload, (list, tuple)) and len(payload) >= 2:
+        price = _coerce_float(payload[0])
+        size = _coerce_float(payload[1])
+        decimals = _infer_price_decimals(payload[0])
+    else:
+        price = _coerce_float(payload)
+        decimals = _infer_price_decimals(payload)
+
+    return price, size, decimals
+
+
+def _extract_best_bid_depth(payload: Any) -> Optional[DepthSample]:
+    def _consider(current: Optional[DepthSample], price: Optional[float], size: Optional[float], decimals: Optional[int]) -> Optional[DepthSample]:
+        if price is None or price <= 0:
+            return current
+        if current is None or price > current.price + 1e-12:
+            return DepthSample(price, size, decimals)
+        if abs(price - current.price) <= 1e-12:
+            if size is None:
+                return DepthSample(price, current.total_size, decimals or current.decimals)
+            if current.total_size is None:
+                return DepthSample(price, size, decimals or current.decimals)
+            return DepthSample(price, current.total_size + size, decimals or current.decimals)
+        return current
+
+    best_sample: Optional[DepthSample] = None
+
+    if isinstance(payload, Mapping):
+        primary_keys = ("best_bid", "bestBid", "bid", "highestBid", "buy")
+        for key in primary_keys:
+            if key in payload:
+                p, s, d = _extract_price_and_size(payload[key])
+                best_sample = _consider(best_sample, p, s, d)
+
+        ladder_keys = ("bids", "bid_levels", "buy_orders", "buyOrders", "buys")
+        for key in ladder_keys:
+            if key in payload:
+                ladder = payload.get(key)
+                if isinstance(ladder, Iterable) and not isinstance(ladder, (str, bytes, bytearray)):
+                    for entry in ladder:
+                        p, s, d = _extract_price_and_size(entry)
+                        best_sample = _consider(best_sample, p, s, d)
+
+        for key, value in payload.items():
+            if not isinstance(key, str):
+                continue
+            normalized = key.strip().lower()
+            if normalized in {"ask", "asks", "sell", "sells", "offers", "offer"}:
+                continue
+            p, s, d = _extract_price_and_size(value)
+            best_sample = _consider(best_sample, p, s, d)
+
+        return best_sample
+
+    if isinstance(payload, Iterable) and not isinstance(payload, (str, bytes, bytearray)):
+        for item in payload:
+            p, s, d = _extract_price_and_size(item)
+            best_sample = _consider(best_sample, p, s, d)
+        return best_sample
+
+    p, s, d = _extract_price_and_size(payload)
+    return _consider(best_sample, p, s, d)
+
+
+def _best_bid_depth(client: Any, token_id: str) -> Optional[DepthSample]:
+    method_candidates = (
+        ("get_market_orderbook", {"market": token_id}, False),
+        ("get_market_orderbook", {"token_id": token_id}, False),
+        ("get_market_orderbook", {"market_id": token_id}, False),
+        ("get_order_book", {"token_id": token_id}, True),
+        ("get_order_book", {"market": token_id}, False),
+        ("get_orderbook", {"token_id": token_id}, True),
+        ("get_orderbook", {"market": token_id}, False),
+    )
+
+    last_exc: Optional[Exception] = None
+    for name, kwargs, allow_positional in method_candidates:
+        fn = getattr(client, name, None)
+        if not callable(fn):
+            continue
+        try:
+            resp = fn(**kwargs)
+        except TypeError:
+            if allow_positional:
+                try:
+                    resp = fn(token_id)
+                except Exception:
+                    continue
+            else:
+                continue
+        except Exception as exc:
+            last_exc = exc
+            continue
+
+        payload = resp
+        if isinstance(resp, tuple) and len(resp) == 2:
+            payload = resp[1]
+        if isinstance(payload, Mapping) and {"data", "status"} <= set(payload.keys()):
+            payload = payload.get("data")
+
+        best = _extract_best_bid_depth(payload)
+        if best is None:
+            continue
+        if best.price <= 0:
+            continue
+        return best
+
+    if last_exc is not None:
+        print(f"[WARN] 获取买一深度过程中出现异常（token_id={token_id}）：{last_exc}")
+    return None
+
+
 def _best_ask(
     client: Any, token_id: str, best_ask_fn: Optional[Callable[[], Optional[float]]]
 ) -> Optional[float]:
@@ -578,6 +713,7 @@ def maker_buy_follow_bid(
     shared_active_prices: Optional[Dict[str, float]] = None,
     price_update_guard: Optional[Callable[[Mapping[str, float]], bool]] = None,
     price_sum_guard: Optional[PriceSumArbitrageGuard] = None,
+    rebid_when_solo: bool = True,
 ) -> Dict[str, Any]:
     """Continuously maintain a maker buy order following the market bid.
     """
@@ -1089,6 +1225,36 @@ def maker_buy_follow_bid(
         current_bid = current_bid_info.price if current_bid_info is not None else None
         if current_bid_info is not None:
             _maybe_update_price_dp(current_bid_info.decimals)
+        if (
+            rebid_when_solo
+            and active_order
+            and active_price is not None
+            and record_size is not None
+        ):
+            depth_info = _best_bid_depth(client, token_id)
+            if depth_info is not None:
+                if depth_info.decimals is not None:
+                    _maybe_update_price_dp(depth_info.decimals)
+                if (
+                    abs(depth_info.price - active_price) <= tick + 1e-12
+                    and depth_info.total_size is not None
+                    and abs(float(depth_info.total_size) - float(record_size)) <= _MIN_FILL_EPS
+                ):
+                    print(
+                        f"[MAKER][BUY] 买一仅剩自身挂单，准备撤单并按盘口最高价重挂 | price={active_price:.{price_dp_active}f} "
+                        f"qty={record_size:.{size_dp_active}f}"
+                    )
+                    _cancel_order(client, active_order)
+                    rec = records.get(active_order)
+                    if rec is not None:
+                        rec["status"] = "CANCELLED"
+                    active_order = None
+                    active_price = None
+                    if shared_active_prices is not None:
+                        shared_active_prices.pop(token_id, None)
+                    if price_sum_guard is not None:
+                        price_sum_guard.clear_price(token_id)
+                    continue
         if remaining <= _MIN_FILL_EPS:
             if active_order:
                 _cancel_order(client, active_order)
@@ -1201,6 +1367,7 @@ def maker_multi_buy_follow_bid(
     price_warmup_timeout: float = 30.0,
     price_warmup_poll: float = 0.5,
     price_sum_threshold: float = 0.99,
+    rebid_when_solo: bool = True,
     **kwargs: Any,
 ) -> Dict[str, Dict[str, Any]]:
     """在多个子市场按相同逻辑挂买单。
@@ -1293,6 +1460,7 @@ def maker_multi_buy_follow_bid(
             per_market_kwargs["price_update_guard"] = _wrap_price_guard(user_guard)
             per_market_kwargs["shared_active_prices"] = shared_active_prices
             per_market_kwargs["price_sum_guard"] = price_guard
+            per_market_kwargs["rebid_when_solo"] = rebid_when_solo
             if best_bid_fns is not None:
                 best_fn = best_bid_fns.get(market_id) if isinstance(best_bid_fns, Mapping) else None
                 if best_fn is not None:

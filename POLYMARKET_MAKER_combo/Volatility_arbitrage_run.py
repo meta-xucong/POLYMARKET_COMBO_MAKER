@@ -1697,6 +1697,10 @@ def main():
     if tracker is None:
         _wait_all_bids_via_rest(token_id_list)
 
+    print("是否开启“买一仅自身挂单时自动撤单重挂”的保护？(Y/n，默认开启)：")
+    solo_requote_raw = input().strip().lower()
+    solo_requote_enabled = not solo_requote_raw.startswith("n")
+
     print("请输入本次每个子问题的下单份数（留空则默认按 5 份执行）：")
     size_raw = input().strip()
     target_size: float = 5.0
@@ -1971,6 +1975,7 @@ def main():
                     progress_probe_interval=10.0,
                     state_callback=_print_state,
                     best_bid_fns=per_token_best,
+                    rebid_when_solo=solo_requote_enabled,
                 )
                 retry_summary = _wait_until_orders_done(retry_summary)
                 for mid, payload in retry_summary.items():
@@ -1992,6 +1997,7 @@ def main():
             progress_probe_interval=10.0,
             state_callback=_print_state,
             best_bid_fns=best_bid_fns,
+            rebid_when_solo=solo_requote_enabled,
         )
         summary = _wait_until_orders_done(summary)
         summary = _ensure_targets_filled(summary)
